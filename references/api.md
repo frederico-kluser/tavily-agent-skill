@@ -18,10 +18,15 @@ Corpo enviado por `scripts/tavily.py search`:
   "max_results": 5,
   "topic": "general",
   "include_answer": true,
-  "chunks_per_source": 3
+  "chunks_per_source": 3,
+  "include_usage": true
 }
 ```
 
+`include_usage` faz a resposta trazer `usage.credits` (créditos realmente
+gastos): o script soma-os a `credits_spent` da conta que serviu — é o que
+mantém viva a estimativa de saldo entre consultas a `/usage` (sem o campo,
+usa o custo documentado: `advanced` = 2, `basic`/`fast`/`ultra-fast` = 1).
 `include_raw_content` nunca é enviado (explosão de contexto). Existem também
 `/extract`, `/crawl`, `/map` e `/research` na API — não cobertos por esta skill.
 
@@ -29,8 +34,28 @@ Corpo enviado por `scripts/tavily.py search`:
 
 `GET https://api.tavily.com/usage` — devolve o consumo real por chave e por
 conta (`key.usage`, `account.current_plan`, `account.plan_usage`,
-`account.plan_limit`) **sem gastar créditos de pesquisa**. É o que alimenta o
-registo interno (`usados/restantes` por conta).
+`account.plan_limit`, e o teto próprio da chave em `key.limit`) **sem gastar
+créditos de pesquisa**. É o que alimenta o registo interno (`usados/restantes`
+por conta): `remaining` é o menor saldo conhecido entre o plano
+(`plan_limit − plan_usage`) e o teto da chave (`key.limit − key.usage`);
+`plan_limit` nulo e sem teto de chave → saldo desconhecido.
+
+Quem consulta `/usage`:
+
+- `status --check` — sempre, em todas as contas (validação ao vivo);
+- `status` sem `--check` — **sozinho**, só nas contas cujo saldo registado tem
+  mais de 60 min (ou nunca foi visto), com timeout curto (5 s) e no máximo
+  **1 consulta por conta a cada 6 min** (conta a última tentativa, com sucesso
+  ou falha — um 429 também conta), nunca em contas REVOKED. A consulta é
+  **reservada atomicamente no registo** (sob `flock`) antes do pedido, por isso
+  N `status` em paralelo fazem 1 consulta, não N; sem registo persistente não há
+  refrescamento automático (o `status` avisa). Pára à primeira falha de rede
+  (não soma timeouts) e diz quais contas refrescou e quais falharam. Cada
+  consulta automática tem um prazo **total** de ~7,7 s (DNS incluído). Um 2xx
+  sem dados de consumo (ex.: proxy ou portal cativo) não conta como sucesso:
+  não apaga o saldo conhecido nem valida a conta (nem no `--check`).
+  `--no-refresh` desliga;
+- `selftest --live` — 1 consulta por conta.
 
 ## Limites da API (medidos em 2026-09)
 
@@ -61,11 +86,11 @@ registo interno (`usados/restantes` por conta).
 | 400 | consulta malformada | **terminal** — não gasta mais chaves | `Erro:` + `Solução:` (simplificar consulta) |
 | 401 | chave inválida/revogada | marca `REVOKED`, rotaciona já | nada (transparente) |
 | 403 | recurso interdito | **terminal** | `Erro:` + `Solução:` |
-| 429 | rate limit | marca cooldown (`Retry-After` ou fórmula), rotaciona | nada |
+| 429 | rate limit | marca cooldown (`Retry-After` em segundos ou data HTTP, máx. 1 h; sem ele, fórmula), rotaciona | nada |
 | 432 | cota mensal esgotada | suspende até 1.º dia do mês seguinte (UTC), rotaciona | nada |
 | 433 | teto PAYGO | igual a 432 | nada |
 | 5xx | instabilidade | rotaciona (transiente) | nada |
-| rede/timeout | socket morto | rotaciona (transiente) | nada |
+| rede/timeout | socket morto ou resposta HTTP malformada | rotaciona (transiente) | nada |
 
 ## Algoritmo de rotação (o ciclo transparente)
 
@@ -75,32 +100,74 @@ arranque:
     cursor = depois da última chave usada      # nunca recomeça sempre em A
 
 para cada passagem (máx. 6):
-    repetir até esgotar a passagem:
-        escolher próxima credencial ACTIVE     # round-robin + reviver cooldowns,
-                                               # salta chaves no teto de concorrência
-        se a conta está no teto de concorrência: saltar para a próxima
-        se TODAS as contas vivas estão ocupadas:
-            esperar (até --max-wait) e repetir  # RETRY — não falha já
-            sem espera disponível → contingência keyless
-        enviar a MESMA request                 # +1 slot in-flight por conta
-        sucesso → devolver resultado
-        401 → REVOKED e continuar              # tudo isto é invisível
-        429 → cooldown e continuar
-        432/433 → suspensão mensal e continuar
-        5xx/rede/timeout → continuar
+    repetir:
+        escolher a próxima conta ACTIVE        # orientada ao saldo (ver abaixo) + round-robin;
+                                               # revive cooldowns expirados; salta as que já
+                                               # falharam NESTA passagem, as ocupadas e as que
+                                               # esgotaram 2 falhas transitórias na invocação
+        conta no teto de concorrência → marcá-la ocupada e escolher outra
+        nenhuma conta disponível:
+            só há contas vivas ocupadas → esperar ~0,5 s e repetir
+                                          (até --max-wait; esgotado → keyless)
+            há contas com UMA falha 5xx/rede → backoff ~0,5 s e 2.ª ronda para elas
+            senão → contingência keyless (1× por passagem) ou fim da passagem
+        enviar a MESMA request                 # reserva 1 slot in-flight na conta
+        sucesso → somar usage.credits à conta e devolver o resultado
+        401 → REVOKED                          # tudo isto é invisível para quem chama
+        429 → cooldown: Retry-After (piso 0,5 s, teto 1 h) ou backoff exponencial
+        432/433 → suspensão até ao dia 1 do mês seguinte (UTC)
+        5xx/rede/timeout → +1 falha transitória (à 2.ª a conta sai desta invocação)
         400/403/outro → erro instrutivo (terminal)
-        sempre → libertar slot e atualizar o registo
-    se pool inteiro impedido:
-        esperar o cooldown mais curto (até --max-wait) e repetir a MESMA request
-senão: erro instrutivo (quantas tentativas, o que fazer)
+        sempre → libertar o PRÓPRIO slot e registar só o que foi observado
+    fim da passagem:
+        esperar o cooldown mais curto das contas que VÃO recuperar
+        (RATE_LIMITED/QUOTA_EXHAUSTED; REVOKED e contas fora da invocação não
+        contam), ou ~0,5 s se ainda houver conta viva, e repetir a MESMA request
+senão: erro instrutivo (tentativas, pool, se o keyless foi tentado, o que fazer)
 ```
+
+Limites garantidos por invocação (o que impede rajadas e esperas infinitas):
+
+- cada conta: no máx. 1 pedido por passagem, mais 1 repetição após uma falha
+  transitória; 2 falhas transitórias (5xx/rede/timeout) tiram-na da invocação;
+- keyless: no máx. 1 pedido por passagem e as mesmas 2 falhas transitórias;
+- todas as esperas (concorrência, backoff, cooldown) somadas: até `--max-wait`
+  (mais o jitter da última);
+- no máx. 6 passagens.
 
 Cooldown quando a API não manda `Retry-After`:
 
 ```
-T = min(60 s, 0.5 s × 2^k) + δ        k = falhas consecutivas da chave
+T = min(60 s, 0.5 s × 2^k) + δ        k = falhas consecutivas da chave (só um sucesso o zera)
                                       δ ∈ [0, 0.5 s) — jitter anti-ressaturação
 ```
+
+## Rotação orientada ao saldo
+
+Com mais do que uma conta ACTIVE, a escolha não é round-robin cego:
+
+```
+saldo(conta) = usage.remaining − (credits_spent − usage.spent_at_check)
+               # último /usage menos os créditos gastos desde essa consulta
+
+candidatas  = ACTIVE, fora do teto de concorrência e não falhadas nesta ronda
+melhor      = maior saldo conhecido entre as candidatas
+escolhida   = a primeira, a partir do cursor, com saldo == melhor (e > 0)
+              OU com saldo desconhecido
+se nenhuma  → a primeira a partir do cursor (a estimativa pode falhar: PAYGO)
+
+saldo desconhecido = sem /usage, /usage de um mês UTC anterior (as cotas
+                     repõem no dia 1) ou carimbo no futuro (relógio avariado)
+```
+
+- Contas com **saldo desconhecido ou igual** continuam em round-robin a partir
+  do cursor persistido — sem nenhum saldo conhecido é exatamente o
+  comportamento clássico (A→B→C) e a invocação seguinte não recomeça em A.
+- Como cada pesquisa desconta créditos reais, duas contas com o mesmo saldo
+  **alternam** (A→B→A…) e uma conta com 900 é drenada até igualar a de 218,
+  em vez de se esgotar a de 218 primeiro.
+- Uma conta com menos saldo não é descartada: continua a ser a alternativa
+  quando as preferidas falham (429/5xx/rede/teto de concorrência).
 
 ## Registo persistente do pool (`pool-state.json`)
 
@@ -113,23 +180,42 @@ Localização: `$TAVILY_STATE_DIR` ou `~/.local/state/tavily-agent-skill/`
   "cursor": "<sha256(key)[:16] da última chave usada>",
   "keys": {
     "<sha256(key)[:16]>": {
-      "ref": "…ilaz", "status": "ACTIVE",
+      "ref": "\u2026ilaz", "status": "ACTIVE",
       "cooldown_until": 0, "failures": 0,
-      "total_requests": 12, "total_failures": 1,
+      "total_requests": 12, "total_failures": 1, "credits_spent": 11,
       "last_error": "HTTP 429", "last_used_at": 1790422235.4,
-      "usage": {"plan": "Researcher", "used": 782, "limit": 1000, "remaining": 218}
+      "usage": {"plan": "Researcher", "used": 782, "limit": 1000, "remaining": 218,
+                "key_used": 782, "key_limit": null,
+                "checked_at": 1790420000.0, "spent_at_check": 4},
+      "usage_queried_at": 1790420000.0
     }
   },
-  "inflight": {"<hash>": [1790422235.4]}
+  "inflight": {"<hash>": [1790422355.4]}
 }
 ```
+
+(O ficheiro é escrito em ASCII puro — `…` aparece como `\u2026`. Cada slot
+in-flight guarda a sua **expiração**, não o início.)
 
 - **Nunca contém material de chave** — cada credencial é identificada por
   `sha256(key)[:16]`; a `ref` visível são os últimos 4 caracteres.
 - Escrita atómica (tmp + `os.replace`) sob `flock` — seguro com vários
   processos a pesquisar em paralelo. O merge cross-processo **não perde
-  observações**: contadores acumulam por delta e o estado vence por severidade
-  (`REVOKED` é absorvente — uma vista antiga não ressuscita uma chave morta).
+  observações**: contadores (requests, falhas, créditos) acumulam por delta, o
+  estado vence por severidade (`REVOKED` é absorvente — uma vista antiga não
+  ressuscita uma chave morta) e o consumo (`usage`) mais recente vence por
+  `checked_at`. Só `status --check` impõe estado com autoridade, e apenas às
+  chaves que acabou de verificar.
+- **Cada processo só regista o que observou** (estado, cooldown e erros das
+  contas que usou ou verificou). Uma pesquisa que carregou o registo antes de
+  um `status --reset-state` ou `--check` nunca o desfaz ao terminar; apagar o
+  ficheiro limpa-o de facto.
+- `spent_at_check` é amostrado do registo **imediatamente antes** do
+  `GET /usage` — créditos gastos por outros processos durante o próprio pedido
+  contam a dobrar (erro conservador: o saldo estimado fica por baixo).
+- Um registo corrompido (JSON inválido, aninhamento absurdo, tipos
+  inesperados, NaN/Infinity, inteiros gigantes) é reduzido aos campos
+  conhecidos ou tratado como ausente — nunca parte uma pesquisa.
 - É isto que impede "tentar sempre em ordem e sempre do início as keys que não
   funcionam": óbitos (401) persistem, cooldowns atravessam invocações e o
   cursor retoma o round-robin onde parou.
@@ -139,8 +225,12 @@ Localização: `$TAVILY_STATE_DIR` ou `~/.local/state/tavily-agent-skill/`
 
 - Teto de requests **simultâneas** por conta: predefinição 2
   (`--max-inflight-per-key` / `TAVILY_MAX_INFLIGHT_PER_KEY`; `0` = sem teto).
-- Slots in-flight são registados cross-processo (com TTL de 120 s contra
-  processos mortos); uma conta no teto é **saltada**, não contada como falha.
+- Slots in-flight são registados cross-processo e guardam a sua expiração:
+  `início + max(120 s, 2 × --timeout + 10 s)` — um pedido longo não perde o slot
+  a meio e um processo morto só o prende até expirar (expirações
+  absurdamente no futuro são descartadas). Uma conta no teto é **saltada**,
+  não contada como falha. Cada processo liberta apenas o seu próprio slot;
+  com teto `0` nenhum slot é reservado (nem libertado).
 - Todas as contas ocupadas → espera (~0,5 s + jitter) e **retry da MESMA
   request**, até `--max-wait`; esgotada a espera, contingência keyless.
 
