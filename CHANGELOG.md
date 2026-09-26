@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.0 — 2026-09-26
+
+### Mudança de contrato (pedido do utilizador)
+- **Rotação com troca de chave a cada chamada**: a rotação passa a ser
+  **round-robin estrito** com cursor global persistente — cada chamada usa a
+  PRÓXIMA chave da vez e a chave da chamada anterior nunca se repete enquanto
+  houver alternativas (A→B→A→B…). Sai a rotação orientada ao saldo: o saldo
+  estimado continua a ser calculado e apresentado (`status`, `keys list`), mas
+  **não decide a ordem**.
+- **Uma chave que falha fica de fora por 1 dia**: qualquer falha da
+  credencial — 429 rate limit, 401 chave morta, 432/433 cota, 5xx, timeout ou
+  rede — resulta em **ban de 24 h** (`--ban-hours` / `TAVILY_BAN_HOURS`):
+  durante o prazo a chave **não é selecionável** em processo nenhum e volta
+  sozinha ao fim dele (ou antes, com `keys unban`). O `Retry-After` do servidor
+  passa a ser ignorado (o ban é fixo). Erros do pedido (400/403) não banem.
+
+### Adicionado
+- **Sistema global de controlo `keys`**: chaves cadastradas num registo comum
+  (`keys.json`, 0600, fora do repo, no `$TAVILY_STATE_DIR`) que valem para
+  QUALQUER agente/terminal — `keys add [--label] [--from-env VAR]` · `remove` ·
+  `enable`/`disable` (fora/para dentro da rotação, globalmente) · `unban
+  [--all]` (readmissão imediata de bans) · `next` (próxima da rotação) · `list`
+  (estado, ban restante, próxima). Seletores por `#índice`, nome/etiqueta,
+  `…últimos4` ou hash. As env vars (`TAVILY_API_KEY[_A..Z]`) continuam a
+  funcionar como pool adicional, deduplicadas por valor.
+- Novos comandos/opções: `search --ban-hours` · `search|status|keys --keys-file`
+  · variáveis `TAVILY_BAN_HOURS` e `TAVILY_KEYS_FILE`.
+- `status` mostra o **ban restante** de cada chave (`FORA DE ROTAÇÃO por mais
+  …`) e a **próxima chave da rotação**; `keys list` mostra a tabela global.
+- Novo estado `SUSPENDED` para ban por falha transitória (5xx/rede), com o
+  último erro sempre visível.
+- Selftest: 96 → **103 cenários** (ban de 24 h por classe de falha, round-robin
+  estrito, banidos não selecionáveis, revive ao fim do ban, `keys`
+  add/remove/disable/enable/unban/next, `keys.json` corrompido, prioridade do
+  `--ban-hours`).
+
+### Removido
+- Rotação por saldo, backoff exponencial de 429, teto de 1 h no `Retry-After`,
+  repete-de-2.ª-ronda para falhas transitórias (`TRANSIENT_STRIKES`) e a
+  suspensão de cota até ao mês seguinte — substituídos pelo ban plano de 24 h.
+  O parser de `Retry-After` (delta/data HTTP) sai com eles.
+
+### Compatibilidade
+- Entradas `REVOKED` sem prazo escritas pela v0.3.x continuam permanentes
+  (só `keys unban`/`--reset-state` as libertam); com prazo, revivem ao fim.
+- `pool-state.json` mantém o formato (`version: 1`); `keys.json` é aditivo.
+
 ## 0.3.0 — 2026-09-26
 
 ### Adicionado

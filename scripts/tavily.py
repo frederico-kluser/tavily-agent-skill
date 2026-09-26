@@ -9,17 +9,28 @@ Contrato com o agente que invoca:
 
 Gestão de requests (o ponto central): se uma request morrer — limite de taxa
 (429), cota esgotada (432/433), chave inválida (401), timeout, erro de servidor
-(5xx) ou falha de rede — o script marca a credencial, escolhe OUTRA chave e
-refaz a MESMA request. Se todo o pool estiver impedido, espera pelo cooldown
-mais curto (até --max-wait) e repete; só depois disso desiste com erro
-instrutivo. A contingência keyless (X-Tavily-Access-Mode) entra como penúltimo
-recurso.
+(5xx) ou falha de rede — a credencial que falhou fica FORA DE ROTAÇÃO POR 24 h
+(BAN_S; `--ban-hours` / TAVILY_BAN_HOURS) e o script escolhe OUTRA chave para
+refazer a MESMA request. Uma chave banida NÃO é selecionável até o ban expirar
+ou `keys unban` mandá-la de volta. Exceção: 400 (consulta malformada) e 403
+(recurso interdito) são erros do PEDIDO, não da chave — não banem nada.
 
-Controlos de pool (persistentes entre invocações):
-  * REGISTO INTERNO por chave (`pool-state.json`) — estado (ACTIVE/…), cooldowns,
-    contadores, último erro, consumo (/usage) e cursor de round-robin. A próxima
-    invocação NÃO recomeça do início nem re-tenta chaves mortas: retoma onde
-    ficou e salta o que já se provou não funcionar.
+Rotação: ROUND-ROBIN ESTRICTO com cursor global persistente — cada chamada usa
+a PRÓXIMA chave da vez; a chave da chamada anterior nunca se repete enquanto
+houver alternativas. O saldo estimado NÃO manda na ordem (aparece no `status`).
+
+Sistema global de controlo (comando `keys` — partilhado por TODOS os agentes):
+  * `keys list|add|remove|enable|disable|unban|next` gere o REGISTO GLOBAL de
+    chaves cadastradas (`keys.json`, 0600, fora do repo) e os bans. Chaves
+    desativadas ficam de fora da rotação em qualquer terminal; bans vivem no
+    registo do pool e valem para todos os processos.
+
+Registos persistentes (globais entre invocações/agentes/terminais):
+  * REGISTO DE CHAVES (`keys.json`) — material de chave a 0600 (único ficheiro
+    que o contém; nunca sai em claro: toda a saída redige).
+  * REGISTO DO POOL (`pool-state.json`) — estado por hash de chave (nunca o
+    material), bans, contadores, último erro, consumo (/usage) e cursor de
+    round-robin. A próxima invocação retoma onde a anterior ficou.
   * LIMITE DE REQUESTS SIMULTÂNEAS por conta (in-flight cross-processo) com
     espera e retry; teto por `--max-inflight-per-key` / TAVILY_MAX_INFLIGHT_PER_KEY.
   * `status --check` valida ao vivo via endpoint /usage (NÃO gasta créditos de
@@ -29,12 +40,13 @@ Limites da API Tavily (medidos em 2026-09, ver references/api.md): 100 RPM por
 chave dev / 1000 RPM produção nos endpoints normais; excesso → 429 com
 Retry-After; 432/433 = cota do plano; 401/403 = chave inválida.
 
-Chaves (pool com rotação automática):
+Chaves (pool com rotação automática — soma tudo):
+  keys.json               registo global (recomendado: cadastre uma vez)
   TAVILY_API_KEY          chave única (opcional)
-  TAVILY_API_KEY_A..Z     agrupamento de contas (round-robin determinístico)
+  TAVILY_API_KEY_A..Z     agrupamento de contas (deduplicadas por valor)
 
-Apenas stdlib. O registo persiste APENAS metadados opacos (identificação por
-sha256 da chave, nunca o material) em $TAVILY_STATE_DIR ou
+Apenas stdlib. O registo do pool persiste APENAS metadados opacos (identificação
+por sha256 da chave, nunca o material) em $TAVILY_STATE_DIR ou
 $XDG_STATE_HOME/tavily-agent-skill — use `--no-state` para o modo efémero.
 """
 
@@ -43,8 +55,6 @@ from __future__ import annotations
 import argparse
 import calendar
 import contextlib
-import datetime
-import email.utils
 import hashlib
 import http.client
 import io
@@ -75,14 +85,15 @@ DEFAULT_MAX_WAIT = 30.0
 DEFAULT_MAX_BYTES = 50 * 1024
 DEFAULT_MAX_INFLIGHT = 2
 COOLDOWN_BASE_S = 0.5
-COOLDOWN_MAX_S = 60.0
 COOLDOWN_JITTER_S = 0.5
-RETRY_AFTER_MAX_S = 3600.0  # Retry-After absurdo não pode "matar" uma chave por anos
+BAN_S = 24.0 * 3600.0   # uma chave que FALHA fica fora de rotação 24 h (não selecionável)
+BAN_HOURS_DEFAULT = 24.0
+BAN_HOURS_MAX = 24.0 * 30.0
 CONCURRENCY_RETRY_S = 0.5
 INFLIGHT_TTL_S = 120.0          # validade mínima de um slot in-flight (processo morto não o prende)
 MAX_PASSES = 6
-TRANSIENT_STRIKES = 2  # falhas transitórias (5xx/rede) por credencial — e keyless — por invocação
 STATE_VERSION = 1
+KEYS_VERSION = 1
 USAGE_STALE_S = 3600.0         # saldo registado com mais de 60 min → refrescar no `status`
 USAGE_MIN_INTERVAL_S = 360.0   # /usage: 10 req/10 min → no máx. 1 consulta automática a cada 6 min
 AUTO_REFRESH_TIMEOUT_S = 5.0   # o refrescamento automático nunca pendura o `status`
@@ -163,7 +174,8 @@ class SkillError(Exception):
 class KeyMeta:
     env_name: str
     key: str
-    status: str = "ACTIVE"  # ACTIVE | RATE_LIMITED | QUOTA_EXHAUSTED | REVOKED
+    source: str = "terminal"  # "registo" (keys.json) | "terminal" (env)
+    status: str = "ACTIVE"  # ACTIVE | SUSPENDED | RATE_LIMITED | QUOTA_EXHAUSTED | REVOKED
     cooldown_until: float = 0.0
     failures: int = 0
     total_requests: int = 0
@@ -305,7 +317,7 @@ def default_state_dir() -> str:
     return os.path.join(base, "tavily-agent-skill")
 
 
-STATUS_SEVERITY = {"ACTIVE": 0, "RATE_LIMITED": 1, "QUOTA_EXHAUSTED": 2, "REVOKED": 3}
+STATUS_SEVERITY = {"ACTIVE": 0, "SUSPENDED": 1, "RATE_LIMITED": 1, "QUOTA_EXHAUSTED": 2, "REVOKED": 3}
 
 
 def _usage_checked_at(usage, now: float) -> float:
@@ -604,6 +616,28 @@ class PoolState:
         with self._lock():
             self._save()
 
+    def unban(self, hash_ids: set | frozenset, now: float | None = None) -> int:
+        """Readmite imediatamente as chaves de `hash_ids` (controlo global):
+        estado ACTIVE e ban levantado. Devolve quantas estavam realmente fora.
+        Chaves sem entrada no registo estão, por definição, sem ban."""
+        if not hash_ids:
+            return 0
+        changed = 0
+        with self._lock():
+            self._load()
+            entries = self.data.setdefault("keys", {})
+            for key_id in hash_ids:
+                entry = entries.get(key_id)
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("status") != "ACTIVE" or _as_float(entry.get("cooldown_until")) > 0:
+                    changed += 1
+                entry["status"] = "ACTIVE"
+                entry["cooldown_until"] = 0.0
+                entry["updated_at"] = time.time() if now is None else now
+            self._save()
+        return changed
+
     def claim_usage_query(self, key: KeyMeta, now: float, min_interval: float = USAGE_MIN_INTERVAL_S) -> bool:
         """Reserva ATÓMICA (sob flock) de uma consulta automática a /usage para a
         conta: recusa se outro processo já refrescou o saldo ou consultou há
@@ -698,15 +732,210 @@ class PoolState:
 
 
 # --------------------------------------------------------------------------
+# registo global de chaves cadastradas (keys.json — sistema de controlo)
+# --------------------------------------------------------------------------
+
+def default_keys_file(state_dir: str | None = None) -> str:
+    """Ficheiro do registo global de chaves: $TAVILY_KEYS_FILE manda; senão
+    `<state-dir>/keys.json` (o mesmo diretório do registo do pool)."""
+    env_file = (os.environ.get("TAVILY_KEYS_FILE") or "").strip()
+    if env_file:
+        return env_file
+    base = (state_dir or "").strip() or default_state_dir()
+    return os.path.join(base, "keys.json")
+
+
+def _sanitize_registry_entry(entry, index: int) -> dict | None:
+    """Entrada válida do registo de chaves: material com formato aceitável +
+    etiqueta limpa. Lixo → None (nunca rebenta)."""
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("key")
+    if not isinstance(value, str) or not valid_key_format(value):
+        return None
+    label = entry.get("label")
+    label = _clean_text(label)[:64] if isinstance(label, str) and label.strip() else f"key-{index + 1}"
+    return {"key": value, "label": label, "added_at": _as_float(entry.get("added_at"))}
+
+
+class KeyRegistry:
+    """Registo GLOBAL de chaves cadastradas (`keys.json`, 0600, fora do repo).
+
+    Sistema de controlo da rotação: o que está aqui vale para QUALQUER agente
+    ou terminal — a soma com as variáveis de ambiente é deduplicada por valor.
+    A lista `disabled` (por hash) tira chaves da rotação sem as apagar.
+    É o ÚNICO ficheiro que contém material de chave: vive fora do repo, é
+    gravado atomicamente a 0600 e nunca é ecoado (redação em toda a saída).
+    `path=None` → modo memória (selftest)."""
+
+    def __init__(self, path: str | None):
+        self.path = path
+        self.degraded = False
+        self.data: dict = {"version": KEYS_VERSION, "keys": [], "disabled": []}
+
+    @classmethod
+    def memory(cls) -> "KeyRegistry":
+        return cls(None)
+
+    @classmethod
+    def open(cls, path: str | None = None) -> "KeyRegistry":
+        registry = cls((path or "").strip() or default_keys_file())
+        registry._load()
+        return registry
+
+    @property
+    def _file(self) -> str:
+        return self.path or ""
+
+    def describe(self) -> str:
+        if self.degraded:
+            return "indisponível (degradado para modo memória)"
+        return self._file if self.path else "modo memória (não persistente)"
+
+    def _lock(self) -> _FileLock:
+        return _FileLock(self.path + ".lock" if self.path else None)
+
+    def _load(self) -> None:
+        if not self.path:
+            return
+        try:
+            with open(self._file, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            self.data = {"version": KEYS_VERSION, "keys": [], "disabled": []}
+            return
+        except (OSError, ValueError, RecursionError):
+            self.data = {"version": KEYS_VERSION, "keys": [], "disabled": []}
+            return
+        self.data = self._sanitize(data)
+
+    @staticmethod
+    def _sanitize(data) -> dict:
+        if not isinstance(data, dict) or data.get("version") != KEYS_VERSION:
+            return {"version": KEYS_VERSION, "keys": [], "disabled": []}
+        raw = data.get("keys") if isinstance(data.get("keys"), list) else []
+        entries = [sane for sane in (_sanitize_registry_entry(e, i) for i, e in enumerate(raw[:1000])) if sane]
+        disabled = data.get("disabled") if isinstance(data.get("disabled"), list) else []
+        out_disabled = []
+        for item in disabled[:2000]:
+            text = _clean_text(item)[:64] if isinstance(item, str) else ""
+            if text and text not in out_disabled:
+                out_disabled.append(text)
+        return {"version": KEYS_VERSION, "keys": entries, "disabled": out_disabled}
+
+    def _save(self) -> None:
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._file), mode=0o700, exist_ok=True)
+            tmp = self._file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(self.data, handle, ensure_ascii=True, indent=2)
+                handle.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self._file)
+        except (OSError, ValueError, RecursionError) as exc:
+            self.degraded = True
+            self.path = None
+            logv(f"registo de chaves indisponível ({type(exc).__name__}) — a continuar sem persistência")
+
+    @property
+    def persistent(self) -> bool:
+        return bool(self.path) and not self.degraded
+
+    def entries(self) -> list[dict]:
+        return list(self.data.get("keys") or [])
+
+    def disabled(self) -> set[str]:
+        return set(self.data.get("disabled") or [])
+
+    def find(self, value: str) -> dict | None:
+        for entry in self.entries():
+            if entry["key"] == value:
+                return entry
+        return None
+
+    def add(self, value: str, label: str | None = None, now: float | None = None) -> tuple[dict, bool]:
+        """Cadastra (ou atualiza a etiqueta de) uma chave. Devolve (entrada, é_nova)."""
+        with self._lock():
+            self._load()
+            existing = self.find(value)
+            if existing is not None:
+                if label:
+                    existing["label"] = _clean_text(label)[:64]
+                    self._save()
+                return existing, False
+            entry = {"key": value, "label": _clean_text(label or "")[:64] or "",
+                     "added_at": time.time() if now is None else now}
+            sane = _sanitize_registry_entry(entry, len(self.data["keys"]))
+            self.data["keys"].append(sane)
+            self._save()
+            return sane, True
+
+    def remove(self, value: str) -> bool:
+        with self._lock():
+            self._load()
+            before = len(self.data["keys"])
+            self.data["keys"] = [e for e in self.data["keys"] if e["key"] != value]
+            if len(self.data["keys"]) == before:
+                return False
+            self._save()
+            return True
+
+    def set_disabled(self, hash_id: str, flag: bool) -> None:
+        with self._lock():
+            self._load()
+            disabled = self.data.setdefault("disabled", [])
+            if flag and hash_id not in disabled:
+                disabled.append(hash_id)
+            elif not flag and hash_id in disabled:
+                disabled.remove(hash_id)
+            self._save()
+
+
+def build_pool(registry: KeyRegistry | None = None, env: dict[str, str] | None = None) -> list[KeyMeta]:
+    """Pool efetivo = registo global (por ordem de cadastro) + variáveis do
+    terminal, com dedupe por VALOR (uma chave em ambos os sítios conta uma vez;
+    o nome do registo é o canónico e a variável vira alias)."""
+    env = os.environ if env is None else env
+    pool: list[KeyMeta] = []
+    by_value: dict[str, KeyMeta] = {}
+    for entry in (registry.entries() if registry is not None else []):
+        value = entry["key"]
+        if value in by_value:
+            continue
+        meta = KeyMeta(entry["label"], value, source="registo")
+        by_value[value] = meta
+        pool.append(meta)
+    for k in load_keys(env):
+        if k.key in by_value:
+            by_value[k.key].aliases.append(k.env_name)
+            by_value[k.key].aliases.extend(k.aliases)
+        else:
+            by_value[k.key] = k
+            pool.append(k)
+    return pool
+
+
+def selectable_pool(pool: list[KeyMeta], registry: KeyRegistry | None = None) -> list[KeyMeta]:
+    """Sem as chaves DESATIVADAS no registo global (a lista `disabled` conta por
+    hash de chave — cobre chaves do registo e do terminal)."""
+    disabled = registry.disabled() if registry is not None else set()
+    return [k for k in pool if k.hash_id not in disabled]
+
+
+# --------------------------------------------------------------------------
 # máquina de estados do pool
 # --------------------------------------------------------------------------
 
 def revive(pool: list[KeyMeta], now: float) -> None:
-    """Recuperação lazy: cooldowns expirados voltam a ACTIVE (REVOKED nunca).
-    As falhas consecutivas mantêm-se — só um sucesso as zera — para que o
-    backoff exponencial de 429 sem Retry-After escale de facto."""
+    """Recuperação lazy: um ban EXPIRADO devolve a chave à rotação (ACTIVE).
+
+    Qualquer estado fora de ACTIVE volta quando `cooldown_until` passar; uma
+    entrada REVOKED SEM prazo (escrita por versões antigas, sem ban) mantém-se
+    fora para sempre — só `keys unban`/`--reset-state` a libertam."""
     for k in pool:
-        if k.status in ("RATE_LIMITED", "QUOTA_EXHAUSTED") and now >= k.cooldown_until:
+        if k.status != "ACTIVE" and k.cooldown_until > 0 and now >= k.cooldown_until:
             k.status, k.cooldown_until = "ACTIVE", 0.0
 
 
@@ -736,57 +965,52 @@ def effective_remaining(k: KeyMeta, now: float | None = None):
 
 
 def pick_key(pool: list[KeyMeta], cursor: int, now: float, skip: frozenset | set = frozenset()) -> tuple[KeyMeta | None, int]:
-    """Escolhe a próxima credencial ACTIVE (fora de `skip`); None → contingência keyless.
+    """Escolhe a próxima credencial ACTIVE em ROUND-ROBIN ESTRICTO (fora de
+    `skip`); None → contingência keyless.
 
-    Orientada ao saldo: uma conta cujo saldo estimado é conhecido e inferior
-    ao MELHOR saldo conhecido (ou nulo) fica para trás. Entre as restantes —
-    saldo igual ao melhor ou desconhecido — mantém-se o round-robin a partir do
-    cursor. Sem nenhum saldo conhecido é exatamente o round-robin clássico.
+    A ordem é sempre o cursor: a chave usada na chamada anterior passa para o
+    fim da fila e nunca se repete enquanto houver alternativas. O saldo
+    estimado NÃO altera a escolha (só é apresentado no `status`). Chaves com
+    ban ativo não são selecionáveis — o `revive` devolve-as quando o ban expira.
     """
     revive(pool, now)
     n = len(pool)
-    candidates = [idx for idx in ((cursor + i) % n for i in range(n))
-                  if pool[idx].status == "ACTIVE" and pool[idx].hash_id not in skip]
-    if not candidates:
-        return None, cursor
-    balance = {idx: effective_remaining(pool[idx], now) for idx in candidates}
-    known = [b for b in balance.values() if b is not None]
-    best = max(known) if known else None
-    for idx in candidates:
-        b = balance[idx]
-        if b is None or (b >= best and b > 0):
-            return pool[idx], idx + 1
-    idx = candidates[0]  # todas com saldo estimado nulo: a estimativa pode falhar (PAYGO)
-    return pool[idx], idx + 1
+    for i in range(n):
+        idx = (cursor + i) % n
+        k = pool[idx]
+        if k.status == "ACTIVE" and k.hash_id not in skip:
+            return k, idx + 1
+    return None, cursor
 
 
-def mark_rate_limited(k: KeyMeta, retry_after_s: float | None, now: float, rng) -> None:
-    """429: arrefece a chave. Retry-After manda (com piso de 0,5 s — um
-    `Retry-After: 0` não pode gerar uma rajada — e teto de 1 h); sem ele,
-    backoff exponencial pelas falhas consecutivas + jitter."""
-    k.status = "RATE_LIMITED"
+def _ban_key(k: KeyMeta, status: str, now: float, ban_s: float) -> None:
+    """Exclui a chave da rotação durante `ban_s` (predef. 24 h) — por QUALQUER
+    falha (429, 401, 432/433, 5xx, timeout, rede). Enquanto o ban não expirar
+    a chave não é selecionável; `keys unban` antecipa o regresso."""
+    k.status = status
     k.failures += 1
     k.dirty = True
-    if retry_after_s is not None:
-        delay = min(max(COOLDOWN_BASE_S, retry_after_s), RETRY_AFTER_MAX_S)
-    else:
-        delay = min(COOLDOWN_MAX_S, COOLDOWN_BASE_S * (2 ** k.failures)) + rng() * COOLDOWN_JITTER_S
-    k.cooldown_until = now + delay
+    k.cooldown_until = now + max(0.0, float(ban_s))
 
 
-def mark_quota_exhausted(k: KeyMeta, now: float) -> None:
-    """432/433: a Tavily repõe cotas no 1.º dia do mês civil seguinte (UTC)."""
-    k.status = "QUOTA_EXHAUSTED"
-    k.failures += 1
-    k.dirty = True
-    t = time.gmtime(now)
-    year, month = (t.tm_year + 1, 1) if t.tm_mon == 12 else (t.tm_year, t.tm_mon + 1)
-    k.cooldown_until = float(calendar.timegm((year, month, 1, 0, 0, 0)))
+def mark_rate_limited(k: KeyMeta, now: float, ban_s: float = BAN_S) -> None:
+    """429 (limite de taxa): fora de rotação pelo ban (24 h por omissão)."""
+    _ban_key(k, "RATE_LIMITED", now, ban_s)
 
 
-def mark_revoked(k: KeyMeta) -> None:
-    k.status = "REVOKED"
-    k.dirty = True
+def mark_quota_exhausted(k: KeyMeta, now: float, ban_s: float = BAN_S) -> None:
+    """432/433 (cota do plano): fora de rotação pelo ban (24 h por omissão)."""
+    _ban_key(k, "QUOTA_EXHAUSTED", now, ban_s)
+
+
+def mark_suspended(k: KeyMeta, now: float, ban_s: float = BAN_S) -> None:
+    """Falha transitória (5xx/timeout/rede): fora de rotação pelo ban (24 h)."""
+    _ban_key(k, "SUSPENDED", now, ban_s)
+
+
+def mark_revoked(k: KeyMeta, now: float, ban_s: float = BAN_S) -> None:
+    """401/403 (chave inválida/interdita): fora de rotação pelo ban (24 h)."""
+    _ban_key(k, "REVOKED", now, ban_s)
 
 
 # --------------------------------------------------------------------------
@@ -811,25 +1035,6 @@ def classify(status: int) -> str:
     if 500 <= status < 600:
         return "transient"
     return "unexpected"
-
-
-def parse_retry_after(value: str | None, now: float) -> float | None:
-    """Retry-After em segundos: delta inteiro ou data HTTP (RFC 9110, ex.
-    "Wed, 21 Oct 2026 07:28:00 GMT"). Independente do locale; lixo → None."""
-    if not value:
-        return None
-    text = value.strip()
-    if text.isascii() and text.isdigit():
-        return float(text)
-    try:
-        when = email.utils.parsedate_to_datetime(text)
-    except (TypeError, ValueError, IndexError, OverflowError):
-        return None
-    if when is None:
-        return None
-    if when.tzinfo is None:  # "-0000" = UTC sem zona declarada
-        when = when.replace(tzinfo=datetime.timezone.utc)
-    return max(0.0, when.timestamp() - now)
 
 
 def _read_json(stream):
@@ -918,8 +1123,8 @@ def refresh_usage(k: KeyMeta, *, get, timeout: float, now: float) -> tuple[str, 
 
     Regista sempre `usage_queried_at` (mesmo em falha — é o que impede rajadas
     contra o limite de 10 req/10 min); em sucesso grava o saldo e o ponto de
-    partida da estimativa (`spent_at_check`); 401 → REVOKED. Devolve
-    (classificação, HTTP status); falhas de rede levantam OSError.
+    partida da estimativa (`spent_at_check`); 401 → REVOKED (ban de 24 h).
+    Devolve (classificação, HTTP status); falhas de rede levantam OSError.
     """
     k.usage_queried_at = now
     status, payload = get(USAGE_URL, {"Authorization": "Bearer " + k.key}, timeout)
@@ -932,7 +1137,7 @@ def refresh_usage(k: KeyMeta, *, get, timeout: float, now: float) -> tuple[str, 
         k.usage["spent_at_check"] = k.credits_spent
         k.usage_dirty = True
     elif kind == "unauthorized":
-        mark_revoked(k)
+        mark_revoked(k, now)
     return kind, status
 
 
@@ -1063,25 +1268,26 @@ def run_search(
     max_inflight: int = DEFAULT_MAX_INFLIGHT,
     keyless: bool = True,
     max_attempts: int | None = None,
+    ban_s: float = BAN_S,
     post=None,
     sleep=time.sleep,
     rng=random.random,
     now=time.time,
 ) -> dict:
     """
-    Executa a pesquisa DONDE o chamador nunca vê falhas transitórias:
-    qualquer morte de request (429/432/433/401/5xx/rede/timeout) provoca
-    rotação de credencial e reemissão da MESMA request.
+    Executa a pesquisa DONDE o chamador nunca vê falhas de rotação: qualquer
+    morte de request (429/432/433/401/5xx/rede/timeout) BANE a credencial por
+    `ban_s` (24 h por omissão) e reemite a MESMA request com a PRÓXIMA chave
+    (round-robin estrito a partir do cursor persistente).
 
-    Por passagem, cada conta é tentada no máx. uma vez (orientada ao saldo,
-    em round-robin a partir do cursor). Contas no teto de concorrência
-    (`max_inflight`; 0 = sem teto) são saltadas; se TODAS as que faltam
-    estiverem ocupadas, espera e repete — até `max_wait`, contado em todas as
-    esperas. Uma falha transitória (5xx/rede) dá à conta uma 2.ª ronda após um
-    backoff curto; ao fim de TRANSIENT_STRIKES falhas transitórias a conta (e o
-    keyless) sai desta invocação. Esgotadas as contas, a contingência keyless
-    (`keyless=False` desliga) é tentada uma vez por passagem; depois espera
-    pelo cooldown mais curto e faz nova passagem (máx. MAX_PASSES).
+    Por passagem, cada conta é tentada no máx. uma vez. Contas no teto de
+    concorrência (`max_inflight`; 0 = sem teto) são saltadas; se TODAS as que
+    faltam estiverem ocupadas, espera e repete — até `max_wait`, contado em
+    todas as esperas. Esgotadas as contas, a contingência keyless
+    (`keyless=False` desliga) é tentada uma vez por passagem; depois espera-se
+    o ban mais curto SE couber em `max_wait` e faz nova passagem
+    (máx. MAX_PASSES) — bans de 24 h nunca são esperados: desiste com erro
+    instrutivo (veja `keys list` / `keys unban`).
     `max_attempts` limita o total de pedidos (ex.: selftest --live).
     """
     if pool is None:
@@ -1129,10 +1335,6 @@ def run_search(
     keyless_attempts = 0
     waited = 0.0
     remaining = 0.0
-    strikes: dict[str, int] = {}  # hash_id | "keyless" → falhas transitórias nesta invocação
-
-    def benched(cred_id: str) -> bool:
-        return strikes.get(cred_id, 0) >= TRANSIENT_STRIKES
 
     def budget_left() -> bool:
         return max_attempts is None or attempts < max_attempts
@@ -1150,13 +1352,10 @@ def run_search(
         for _step in range(step_cap):
             if not budget_left():
                 break
-            out = {k.hash_id for k in pool if benched(k.hash_id)}
-            key, cursor = pick_key(pool, cursor, now(), busy | tried | out)
+            key, cursor = pick_key(pool, cursor, now(), busy | tried)
 
             if key is None:
-                waiting = [k for k in pool if k.status == "ACTIVE" and k.hash_id not in tried | out]
-                retryable = [k for k in pool if k.status == "ACTIVE" and k.hash_id in tried
-                             and 0 < strikes.get(k.hash_id, 0) < TRANSIENT_STRIKES]
+                waiting = [k for k in pool if k.status == "ACTIVE" and k.hash_id not in tried]
                 if waiting:
                     # as contas que faltam estão todas no teto de concorrência: espera e repete
                     pause = CONCURRENCY_RETRY_S + rng() * COOLDOWN_JITTER_S
@@ -1167,17 +1366,8 @@ def run_search(
                         busy.clear()
                         continue
                     logv("orçamento de espera esgotado com contas ocupadas — a usar contingência keyless")
-                elif retryable:
-                    # falha transitória isolada: 2.ª ronda para essas contas, após backoff curto
-                    pause = COOLDOWN_BASE_S + rng() * COOLDOWN_JITTER_S
-                    if waited + pause <= max_wait:
-                        logv(f"falha transitória — a aguardar {pause:.1f}s e a repetir a mesma request")
-                        sleep(pause)
-                        waited += pause
-                        tried.difference_update(k.hash_id for k in retryable)
-                        continue
-                if not keyless or keyless_this_pass or benched("keyless"):
-                    break  # passagem esgotada: segue para a espera de cooldown
+                if not keyless or keyless_this_pass:
+                    break  # passagem esgotada: segue para a espera de ban
 
             token = None
             if key is not None:
@@ -1203,7 +1393,7 @@ def run_search(
                 label = key.ref
 
             try:
-                status, payload, retry_after = post(API_URL, headers, body, timeout)
+                status, payload, _retry_after = post(API_URL, headers, body, timeout)
 
                 kind = classify(status)
                 if kind == "success":
@@ -1237,8 +1427,6 @@ def run_search(
                         "repita a invocação; se persistir, corra `tavily.py status --check` para auditar as chaves.",
                     )
                 if key is None:
-                    if kind == "transient":
-                        strikes["keyless"] = strikes.get("keyless", 0) + 1
                     logv(f"contingência keyless respondeu HTTP {status} — a continuar")
                     continue
                 key.total_failures += 1
@@ -1246,28 +1434,26 @@ def run_search(
                 key.dirty = key.error_observed = True
                 tried.add(key.hash_id)
                 if kind == "unauthorized":
-                    logv(f"chave {key.ref} inválida (401) — removida do pool e a rotacionar")
-                    mark_revoked(key)
+                    logv(f"chave {key.ref} inválida (401) — fora de rotação {ban_s / 3600:.0f} h e a rotacionar")
+                    mark_revoked(key, now(), ban_s)
                     continue
                 if kind == "rate-limited":
-                    wait = parse_retry_after(retry_after, now())
-                    logv(f"chave {key.ref} em rate limit (429) — a rotacionar")
-                    mark_rate_limited(key, wait, now(), rng)
+                    logv(f"chave {key.ref} em rate limit (429) — fora de rotação {ban_s / 3600:.0f} h e a rotacionar")
+                    mark_rate_limited(key, now(), ban_s)
                     continue
                 if kind in ("quota-exhausted", "paygo-exhausted"):
-                    logv(f"chave {key.ref} sem cota (HTTP {status}) — suspensa e a rotacionar")
-                    mark_quota_exhausted(key, now())
+                    logv(f"chave {key.ref} sem cota (HTTP {status}) — fora de rotação {ban_s / 3600:.0f} h e a rotacionar")
+                    mark_quota_exhausted(key, now(), ban_s)
                     continue
-                strikes[key.hash_id] = strikes.get(key.hash_id, 0) + 1
-                logv(f"instabilidade transitória (HTTP {status}) com {key.ref} — a rotacionar")
+                logv(f"instabilidade transitória (HTTP {status}) com {key.ref} — fora de rotação {ban_s / 3600:.0f} h e a rotacionar")
+                mark_suspended(key, now(), ban_s)
             except OSError as exc:
-                cred_id = "keyless" if key is None else key.hash_id
-                strikes[cred_id] = strikes.get(cred_id, 0) + 1
                 if key is not None:
                     key.total_failures += 1
                     key.last_error = "rede/timeout"
                     key.dirty = key.error_observed = True
                     tried.add(key.hash_id)
+                    mark_suspended(key, now(), ban_s)
                 logv(f"falha de rede/timeout com {label}: {exc} — a rotacionar")
             finally:
                 if key is not None and token is not None:
@@ -1276,15 +1462,13 @@ def run_search(
 
         if not budget_left():
             break
-        # passagem esgotada: espera pelo cooldown mais curto das chaves que VÃO
-        # recuperar (REVOKED não conta; uma conta fora da invocação por falhas
-        # transitórias está sempre ACTIVE) e repete a MESMA request.
+        # passagem esgotada: espera o BAN mais curto que caiba em `max_wait` e
+        # repete a MESMA request (um ban de 24 h nunca cabe — desiste logo).
         t = now()
         revive(pool, t)
-        waits = [k.cooldown_until - t for k in pool
-                 if k.status in ("RATE_LIMITED", "QUOTA_EXHAUSTED") and k.cooldown_until > t]
-        if any(k.status == "ACTIVE" and not benched(k.hash_id) for k in pool):
-            waits.append(COOLDOWN_BASE_S)  # conta viva (revivida/ocupada/1 falha): nova passagem em breve
+        waits = [k.cooldown_until - t for k in pool if k.status != "ACTIVE" and k.cooldown_until > t]
+        if any(k.status == "ACTIVE" for k in pool):
+            waits.append(COOLDOWN_BASE_S)  # conta viva (revivida/ocupada): nova passagem em breve
         remaining = min(waits, default=0.0)
         if waits and waited + remaining <= max_wait:
             pause = remaining + rng() * COOLDOWN_JITTER_S
@@ -1301,10 +1485,16 @@ def run_search(
         tail = "contingência keyless não chegou a ser necessária/possível"
     else:
         tail = "contingência keyless desativada"
+    if remaining > 1.0:
+        wait_hint = f"as chaves que falharam ficam fora de rotação por mais ~{_age(remaining)}"
+    else:
+        wait_hint = "todas as chaves do pool estão fora de rotação"
     raise SkillError(
-        f"todas as alternativas falharam ({attempts} tentativa(s); pool: {masked}; {tail}).",
-        f"aguarde ~{max(1, math.ceil(remaining))}s e repita a MESMA invocação, ou declare mais chaves "
-        f"(export TAVILY_API_KEY_E=\"tvly-…\") e repita. `tavily.py status --check` audita o pool.",
+        f"todas as alternativas falharam ({attempts} tentativa(s); pool: {masked}; {tail}; {wait_hint}).",
+        "veja `tavily.py keys list` para os bans ativos e `tavily.py keys unban --all` para readmitir "
+        "chaves (só se tiverem recuperado); de outro modo, cadastre mais chaves "
+        '(`tavily.py keys add "tvly-…"`) e repita a MESMA invocação. '
+        "`tavily.py status --check` audita o pool sem gastar créditos.",
     )
 
 
@@ -1383,12 +1573,16 @@ def _age(seconds: float) -> str:
         return f"{seconds}s"
     if seconds < 3600:
         return f"{seconds // 60} min"
-    return f"{seconds // 3600} h"
+    if seconds < 86400:
+        return f"{seconds // 3600} h"
+    days, hours = divmod(seconds // 3600, 24)
+    return f"{days}d {hours}h"
 
 
 def cmd_status(check: bool, timeout: float, *, state: PoolState, reset_state: bool = False,
                max_inflight: int = DEFAULT_MAX_INFLIGHT, refresh: bool = True,
-               env: dict[str, str] | None = None, now=time.time, get=None) -> int:
+               env: dict[str, str] | None = None, registry: KeyRegistry | None = None,
+               now=time.time, get=None) -> int:
     """Estado do pool (sem segredos). Sem `--check`, refresca sozinho o saldo
     registado há mais de 60 min (no máx. 1 consulta a /usage por conta a cada
     6 min, reservada atomicamente no registo); `refresh=False` desliga.
@@ -1397,12 +1591,16 @@ def cmd_status(check: bool, timeout: float, *, state: PoolState, reset_state: bo
         get = http_get_json
     env = os.environ if env is None else env
     remember_secrets(secret_values(env))
+    if registry is not None:
+        remember_secrets(entry["key"] for entry in registry.entries())
     if reset_state:
         state.reset()  # primeiro — também sem chaves; o pool abaixo parte do registo limpo
-    pool = load_keys(env)
+    all_keys = build_pool(registry, env)
+    pool = selectable_pool(all_keys, registry)
+    disabled_n = len(all_keys) - len(pool)
     state.apply(pool)
     t = now()
-    revive(pool, t)  # cooldowns já expirados aparecem como recuperados
+    revive(pool, t)  # bans já expirados aparecem como recuperados
 
     outcomes: list[tuple[KeyMeta, str]] = []
     refresh_off = False
@@ -1415,13 +1613,14 @@ def cmd_status(check: bool, timeout: float, *, state: PoolState, reset_state: bo
         else:
             refresh_off = any(k.status != "REVOKED" and usage_is_stale(k, t) for k in pool)
 
-    print(f"Pool Tavily: {len(pool)} credencial(is)" + ("" if pool else " — modo keyless puro"))
+    print(f"Pool Tavily: {len(pool)} credencial(is)" + ("" if pool else " — modo keyless puro")
+          + (f" · {disabled_n} desativada(s)" if disabled_n else ""))
     for k in pool:
         bits = [f"req={k.total_requests}", f"err={k.total_failures}"]
         if k.last_error:
             bits.append(f"último={k.last_error}")
-        if k.status in ("RATE_LIMITED", "QUOTA_EXHAUSTED") and k.cooldown_until > t:
-            bits.append(f"cooldown={int(k.cooldown_until - t)}s")
+        if k.status != "ACTIVE" and k.cooldown_until > t:
+            bits.append(f"FORA DE ROTAÇÃO por mais {_age(k.cooldown_until - t)}")
         balance = effective_remaining(k, t)
         if balance is not None:
             limit = k.usage.get("limit") if isinstance(k.usage, dict) else None
@@ -1434,8 +1633,16 @@ def cmd_status(check: bool, timeout: float, *, state: PoolState, reset_state: bo
     for name in invalid_key_vars(env):
         print(f"  {name:<20} [FORMATO INVÁLIDO]  ignorada — o valor tem espaços, aspas, quebras de linha, "
               f"caracteres fora de ASCII ou menos de {MIN_KEY_LEN} caracteres; corrija a variável")
+    next_key, _cursor = pick_key(pool, state.start_cursor(pool), t)
+    if next_key is not None:
+        print(f"Rotação (round-robin estrito): próxima chamada usa {next_key.env_name} {next_key.ref} · "
+              "a seguir troca de chave")
+    elif pool:
+        print("Rotação: nenhuma chave selecionável (todas banidas ou desativadas) — veja `keys list`")
     infl = "sem teto" if max_inflight <= 0 else f"máx. {max_inflight} simultâneas/conta"
     print(f"Registo: {state.describe()}  ·  concorrência: {infl}")
+    if registry is not None:
+        print(f"Chaves cadastradas: {registry.describe()}  ·  controlo: `keys list|add|disable|unban`")
     refreshed = [k.env_name for k, outcome in outcomes if outcome == "ok"]
     failed = [f"{k.env_name} ({outcome})" for k, outcome in outcomes if outcome != "ok"]
     if refreshed:
@@ -1448,9 +1655,10 @@ def cmd_status(check: bool, timeout: float, *, state: PoolState, reset_state: bo
     if reset_state:
         print("\nRegisto limpo — todas as chaves voltam a ser consideradas na próxima pesquisa.")
     if not pool:
-        print("\nNenhuma chave válida no terminal. Declaração (pool recomendado):")
-        print('  export TAVILY_API_KEY_A="tvly-..."')
-        print('  export TAVILY_API_KEY_B="tvly-..."')
+        print("\nNenhuma chave disponível. Controlo global (recomendado):")
+        print('  tavily.py keys add "tvly-..." --label conta-A')
+        print('  tavily.py keys add "tvly-..." --label conta-B')
+        print("Alternativa por terminal: export TAVILY_API_KEY_A=\"tvly-...\" · TAVILY_API_KEY_B=\"tvly-...\"")
         print("Sem chaves o script opera em modo keyless (limites mais severos).")
         return 0
     if check:
@@ -1481,7 +1689,192 @@ def cmd_status(check: bool, timeout: float, *, state: PoolState, reset_state: bo
                 verdict = f"HTTP {status}"
             print(redact(f"  {k.env_name:<20} {k.ref}  → {verdict}", _SECRETS))
         state.snapshot(pool, authoritative=verified, now=now())  # só as verificadas impõem estado
-        print("\nNotas: 401 = revogada · 429 = rate limit (recupera sozinha) · 432 = cota (repõe no 1.º do mês).")
+        print("\nNotas: 401 = revogada (ban de 24 h) · 429 = rate limit (ban de 24 h) · 432 = cota (ban de 24 h). "
+              "Bans levantam-se sozinhos ao fim do prazo ou com `keys unban`.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# controlo global: `keys` (chaves cadastradas, bans e rotação)
+# --------------------------------------------------------------------------
+
+def _keys_rows(registry: KeyRegistry | None, state: PoolState, env: dict, now: float) -> list[dict]:
+    """Linhas do controlo: pool completo (registo + terminal) com estado do
+    registo do pool aplicado, ban restante e marca de desativação."""
+    pool = build_pool(registry, env)
+    disabled = registry.disabled() if registry is not None else set()
+    state.apply(pool)
+    revive(pool, now)
+    rows = []
+    for i, k in enumerate(pool, 1):
+        rows.append({"index": i, "key": k, "name": k.env_name, "ref": k.ref, "source": k.source,
+                     "disabled": k.hash_id in disabled,
+                     "ban_left": max(0.0, k.cooldown_until - now) if k.status != "ACTIVE" else 0.0})
+    return rows
+
+
+def _match_row(rows: list[dict], selector: str | None) -> dict | None:
+    """Seletor: `#índice`, nome/etiqueta, alias, ref (`…ab12`) ou prefixo do hash."""
+    sel = (selector or "").strip()
+    if not sel:
+        return None
+    bare = sel[1:] if sel.startswith("#") else sel
+    if bare.isdigit():
+        idx = int(bare)
+        return rows[idx - 1] if 1 <= idx <= len(rows) else None
+    for row in rows:
+        k = row["key"]
+        if sel == row["name"] or sel == k.ref or sel in k.aliases:
+            return row
+    for row in rows:
+        k = row["key"]
+        if len(sel) >= 4 and k.hash_id.startswith(sel):
+            return row
+    return None
+
+
+def cmd_keys(action: str = "list", target: str | None = None, *,
+             registry: KeyRegistry | None = None, state: PoolState | None = None,
+             key_value: str | None = None, label: str | None = None,
+             from_env: str | None = None, all_: bool = False,
+             env: dict[str, str] | None = None, now=time.time) -> int:
+    """Sistema global de controlo da rotação de chaves (sem segredos na saída)."""
+    registry = KeyRegistry.memory() if registry is None else registry
+    state = PoolState.memory() if state is None else state
+    env = os.environ if env is None else env
+    remember_secrets(entry["key"] for entry in registry.entries())
+    t = now()
+
+    def rows() -> list[dict]:
+        return _keys_rows(registry, state, env, t)
+
+    def need_row() -> dict:
+        row = _match_row(rows(), target)
+        if row is None:
+            raise SkillError(
+                f"não encontrei nenhuma chave para {target!r}.",
+                "veja os seletores válidos com `tavily.py keys list` (use o #índice, o nome, "
+                "os últimos 4 da chave ou o hash).",
+            )
+        return row
+
+    if action == "add":
+        value = (key_value or "").strip()
+        if from_env:
+            value = (env.get(from_env) or "").strip()
+            if not value:
+                raise SkillError(
+                    f"a variável {from_env} está vazia ou não existe neste terminal.",
+                    'exporte-a primeiro ou passe a chave diretamente: tavily.py keys add "tvly-…".',
+                )
+        if not value and target:
+            value = target.strip()
+        if not value:
+            raise SkillError(
+                "falta a chave a cadastrar.",
+                'use tavily.py keys add "tvly-…" --label conta-A '
+                "(ou `keys add --from-env TAVILY_API_KEY_A` para não passar o valor pela linha de comandos).",
+            )
+        if not valid_key_format(value):
+            raise SkillError(
+                "o valor não tem formato de chave Tavily (ASCII imprimível, sem espaços/aspas, "
+                f"mínimo {MIN_KEY_LEN} caracteres).",
+                'confirme a chave em app.tavily.com e repita: tavily.py keys add "tvly-…".',
+            )
+        remember_secrets([value])
+        entry, is_new = registry.add(value, label, now=t)
+        if not registry.persistent:
+            raise SkillError(
+                f"o registo de chaves não está disponível ({registry.describe()}).",
+                "verifique as permissões da pasta do registo (TAVILY_KEYS_FILE/TAVILY_STATE_DIR) e repita.",
+            )
+        note = "cadastrada" if is_new else "já estava cadastrada (etiqueta atualizada)"
+        print(f"Chave {entry['label']} ({'…' + value[-4:]}) {note} em {registry.describe()}.")
+        print("Entra na rotação de QUALQUER agente/terminal; `keys list` mostra a vez de cada uma.")
+        return 0
+
+    if action == "remove":
+        row = need_row()
+        k = row["key"]
+        if k.source != "registo":
+            raise SkillError(
+                f"{row['name']} veio de uma variável do terminal e não está cadastrada no registo global.",
+                "para a tirar da rotação use `keys disable`; para a apagar, remova a variável do terminal.",
+            )
+        registry.remove(k.key)
+        registry.set_disabled(k.hash_id, False)
+        print(f"Chave {row['name']} ({k.ref}) removida do registo global.")
+        return 0
+
+    if action in ("disable", "enable"):
+        row = need_row()
+        k = row["key"]
+        registry.set_disabled(k.hash_id, action == "disable")
+        what = "fora de rotação em todos os agentes" if action == "disable" \
+            else "de volta à rotação (se não estiver banida)"
+        print(f"Chave {row['name']} ({k.ref}): {what}.")
+        return 0
+
+    if action == "unban":
+        if all_ or target is None:
+            if target is None and not all_:
+                raise SkillError(
+                    "é preciso indicar a chave a readmitir (ou todas).",
+                    "use `keys unban #2` / `keys unban <nome>` ou `keys unban --all`.",
+                )
+            target_rows = rows()
+        else:
+            target_rows = [need_row()]
+        changed = state.unban({r["key"].hash_id for r in target_rows}, now=t)
+        print(f"Ban levantado em {changed} chave(s) — voltam a ser selecionáveis já na próxima chamada."
+              if changed else "Nenhuma chave tinha ban ativo — nada a fazer.")
+        return 0
+
+    if action == "next":
+        all_rows = rows()
+        selectable = [r for r in all_rows if not r["disabled"]]
+        active = [r["key"] for r in selectable]
+        state.apply(active)
+        revive(active, t)
+        key, _cursor = pick_key(active, state.start_cursor(active), t)
+        if key is None:
+            print("Próxima da rotação: nenhuma — todas as chaves estão banidas ou desativadas.")
+        else:
+            row = next(r for r in selectable if r["key"].hash_id == key.hash_id)
+            print(f"Próxima da rotação: #{row['index']} {row['name']} {row['ref']} "
+                  f"({row['source']}) — a chamada seguinte usa esta; a outra troca de chave.")
+        return 0
+
+    # list (predefinição)
+    all_rows = rows()
+    registry_n = sum(1 for r in all_rows if r["source"] == "registo")
+    print(f"Controlo global de chaves Tavily: {len(all_rows)} no pool "
+          f"({registry_n} cadastrada(s), {len(all_rows) - registry_n} do terminal)"
+          f" · ban por falha: {_age(resolve_ban_s(None))}")
+    for row in all_rows:
+        k = row["key"]
+        if row["disabled"]:
+            state_label, ban_label = "DESATIVADA", "—"
+        else:
+            state_label = k.status
+            ban_label = _age(row["ban_left"]) if row["ban_left"] > 0 else "—"
+        balance = effective_remaining(k, t)
+        saldo = f"restam {balance}" if balance is not None else "—"
+        print(redact_all(
+            f"  {row['index']:>2}  {row['name'][:20]:<20} {k.ref}  {row['source']:<8}  "
+            f"{state_label:<15} fora={ban_label:<7} req={k.total_requests}/err={k.total_failures}  {saldo}"))
+    selectable = [r for r in all_rows if not r["disabled"]]
+    active = [r["key"] for r in selectable]
+    state.apply(active)
+    revive(active, t)
+    nxt, _cursor = pick_key(active, state.start_cursor(active), t)
+    if nxt is not None:
+        row = next(r for r in selectable if r["key"].hash_id == nxt.hash_id)
+        print(f"Próxima da rotação: #{row['index']} {row['name']} {row['ref']} · round-robin estrito "
+              "(cada chamada troca de chave)")
+    else:
+        print("Próxima da rotação: nenhuma — todas banidas (`keys unban --all`) ou desativadas (`keys enable`).")
+    print(f"Registo de chaves: {registry.describe()}  ·  registo do pool: {state.describe()}")
     return 0
 
 
@@ -1531,14 +1924,15 @@ def cmd_selftest() -> int:
         post, _c = transport([(429, {}, "2"), OK])
         result = run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0)
         assert result["meta"]["attempts"] == 2
-        assert pool[0].status == "RATE_LIMITED" and pool[0].cooldown_until == 2.0
+        assert pool[0].status == "RATE_LIMITED" and pool[0].cooldown_until == BAN_S, \
+            "429 ban a chave 24 h (o Retry-After não encurta o ban)"
 
-    def s_quota_ate_mes_seguinte():
+    def s_quota_bane_24h():
         pool = make_pool("A", "B")
         post, _c = transport([(432, {}, None), OK])
         run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0)
         assert pool[0].status == "QUOTA_EXHAUSTED"
-        assert pool[0].cooldown_until > 0, "devia suspender até ao mês seguinte"
+        assert pool[0].cooldown_until == BAN_S, "cota esgotada também é ban de 24 h"
 
     def s_keyless_quando_pool_morto():
         pool = make_pool("A")
@@ -1552,7 +1946,7 @@ def cmd_selftest() -> int:
         pool = make_pool("A")
         clock = [0.0]
         sleeps: list[float] = []
-        script = [(429, {}, "1"), (503, {}, None), OK]
+        script = [(429, {}, None), OK]
 
         def post(_url, headers, body, _t):
             step = script.pop(0)
@@ -1561,13 +1955,14 @@ def cmd_selftest() -> int:
 
         def fake_sleep(seconds: float) -> None:
             sleeps.append(seconds)
-            clock[0] += seconds  # o relógio avança: a chave A recupera
+            clock[0] += seconds  # o relógio avança: o ban curto de A expira
 
         result = run_search(
-            "q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0], max_wait=30
+            "q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0],
+            max_wait=30, keyless=False, ban_s=2.0,
         )
-        assert result["meta"]["attempts"] == 3
-        assert sleeps and sleeps[0] >= 1.0, "devia esperar o cooldown e repetir"
+        assert result["meta"]["attempts"] == 2
+        assert sleeps and sleeps[0] >= 2.0, "devia esperar o ban curto e repetir"
         assert pool[0].status == "ACTIVE", "a chave A devia ter recuperado e servido a repetição"
 
     def s_400_terminal_sem_rotacao():
@@ -1717,7 +2112,7 @@ def cmd_selftest() -> int:
             s2 = PoolState.open(td)
             s2.apply([k2])
             k2.total_requests += 1
-            mark_revoked(k2)
+            mark_revoked(k2, 0.0)
             s2.snapshot([k2])
             # processo 1 (vista antiga, ainda ACTIVE) tenta regravar
             k1.status = "ACTIVE"
@@ -1765,24 +2160,16 @@ def cmd_selftest() -> int:
                                               "remaining": remaining, "checked_at": checked_at,
                                               "spent_at_check": 0}}
 
-    def s_retry_after_data_http():
-        now = float(calendar.timegm((2026, 10, 21, 7, 27, 30, 0, 0, 0)))
-        date = "Wed, 21 Oct 2026 07:28:00 GMT"
-        assert parse_retry_after(date, now) == 30.0, "data HTTP devia dar 30 s"
-        assert parse_retry_after(date, now + 3600) == 0.0, "data no passado → 0 (nunca negativo)"
-        assert parse_retry_after("7", now) == 7.0, "delta em segundos"
-        for junk in ("amanhã", "²", "-5", "", None):
-            assert parse_retry_after(junk, now) is None, f"{junk!r} devia ser ignorado sem rebentar"
-        pool = make_pool("A", "B")
-        post, _c = transport([(429, {}, date), OK])
-        run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: now)
-        assert pool[0].cooldown_until == now + 30.0, "o 429 com data HTTP devia arrefecer a chave 30 s"
-
-    def s_retry_after_absurdo_limitado():
-        pool = make_pool("A", "B")
-        post, _c = transport([(429, {}, "999999999"), OK])
-        run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0)
-        assert pool[0].cooldown_until == RETRY_AFTER_MAX_S, "Retry-After absurdo tem de ser limitado a 1 h"
+    def s_ban_plano_ignora_retry_after():
+        for header in ("2", "999999999", "Wed, 21 Oct 2026 07:28:00 GMT", "0", "lixo"):
+            pool = make_pool("A", "B")
+            post, _c = transport([(429, {}, header), OK])
+            run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0)
+            assert pool[0].status == "RATE_LIMITED" and pool[0].cooldown_until == BAN_S, \
+                f"Retry-After {header!r} não pode alterar o ban de 24 h (ficou {pool[0].cooldown_until})"
+        k = make_pool("Z")[0]
+        mark_rate_limited(k, 10.0, ban_s=3600.0)
+        assert k.cooldown_until == 10.0 + 3600.0, "o ban é configurável (--ban-hours) mas sempre PLANO"
 
     def s_parse_usage_payload_real():
         u = parse_usage(REAL_USAGE, now=123.0)
@@ -1846,25 +2233,27 @@ def cmd_selftest() -> int:
                                           "TAVILY_API_KEY_C"], names1
         assert names1[1][1] == ["TAVILY_API_KEY_D"], "valor repetido noutra variável é alias, não conta nova"
 
-    # ---- rotação orientada ao saldo (v0.3.0) ----
+    # ---- rotação estrita (v0.4.0): o saldo não manda na ordem ----
 
-    def s_saldo_maior_serve_primeiro():
+    def s_saldo_nao_manda_na_ordem():
         pool = make_pool("A", "B")
         state = PoolState.memory()
         state.data["keys"] = {pool[0].hash_id: usage_entry(5), pool[1].hash_id: usage_entry(900)}
         post, calls = transport([OK])
         run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0, state=state)
-        assert calls[0]["headers"]["Authorization"].endswith("B"), "a conta com 900 restantes devia servir primeiro"
-        assert effective_remaining(pool[1]) == 899, "o crédito gasto desconta do saldo estimado"
+        assert calls[0]["headers"]["Authorization"].endswith("A"), \
+            "round-robin estrito: A é a próxima da vez mesmo com menos saldo"
+        assert effective_remaining(pool[0]) == 4 and effective_remaining(pool[1]) == 900, \
+            "o saldo continua a ser contado — só não decide a ordem"
 
     def write_state(td: str, keys: dict, inflight: dict | None = None) -> None:
         with open(os.path.join(td, "pool-state.json"), "w", encoding="utf-8") as handle:
             json.dump({"version": STATE_VERSION, "cursor": None, "keys": keys, "inflight": inflight or {}}, handle)
 
-    def s_saldo_igual_alterna_com_cursor():
+    def s_round_robin_estrito_alterna_entre_invocacoes():
         with tempfile.TemporaryDirectory() as td:
             seed = make_pool("A", "B")
-            write_state(td, {seed[0].hash_id: usage_entry(900), seed[1].hash_id: usage_entry(901)})
+            write_state(td, {seed[0].hash_id: usage_entry(5), seed[1].hash_id: usage_entry(900)})
             used = []
             for i in range(3):
                 pool = make_pool("A", "B")
@@ -1872,10 +2261,10 @@ def cmd_selftest() -> int:
                 run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0,
                            now=lambda: float(i), state=PoolState.open(td))
                 used.append(calls[0]["headers"]["Authorization"][-1])
-            # 901 serve (→900); empate 900/900 → cursor (depois de B) → A (→899); B 900 volta a servir
-            assert used == ["B", "A", "B"], f"o saldo estimado tem de guiar e o cursor desempatar (obtido {used})"
+            assert used == ["A", "B", "A"], \
+                f"cada chamada troca de chave, sem repetir a anterior (obtido {used})"
             entries = PoolState.open(td).data["keys"]
-            assert entries[seed[0].hash_id]["credits_spent"] == 1 and entries[seed[1].hash_id]["credits_spent"] == 2
+            assert entries[seed[0].hash_id]["credits_spent"] == 2 and entries[seed[1].hash_id]["credits_spent"] == 1
 
     def s_saldo_falha_transitoria_ainda_rotaciona():
         pool = make_pool("A", "B")
@@ -1916,7 +2305,7 @@ def cmd_selftest() -> int:
         k, dead = make_pool("A", "B")
         k.usage = {"remaining": 900, "checked_at": T - 7200}
         k.usage_queried_at = T - 180  # tentativa falhada há 3 min
-        mark_revoked(dead)
+        mark_revoked(dead, T)
         get, calls = fake_get([(429, {}), OSError("timeout")])
         auto_refresh_usage([k, dead], get=get, now=T, timeout=1.0)
         assert calls == [], "consulta há < 6 min: não pode repetir (limite de 10 req/10 min)"
@@ -1961,7 +2350,7 @@ def cmd_selftest() -> int:
 
     # ---- robustez do contrato (v0.3.0) ----
 
-    def s_revogada_nao_impede_espera_de_cooldown():
+    def s_espera_o_ban_mais_curto():
         pool = make_pool("A", "B")
         clock = [0.0]
         sleeps: list[float] = []
@@ -1970,11 +2359,14 @@ def cmd_selftest() -> int:
             sleeps.append(seconds)
             clock[0] += seconds
 
-        post, calls = transport([(401, {}, None), (429, {}, "2"), (503, {}, None), OK])
+        mark_rate_limited(pool[0], 0.0, ban_s=2.0)     # A volta em 2 s
+        mark_revoked(pool[1], 0.0, ban_s=50.0)         # B (também fora) só em 50 s
+        post, calls = transport([OK])
         result = run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0,
-                            now=lambda: clock[0], max_wait=30)
-        assert sleeps and sleeps[-1] >= 2.0, "com A revogada, devia esperar pelo cooldown de B (não desistir)"
-        assert calls[-1]["headers"]["Authorization"].endswith("B") and result["meta"]["attempts"] == 4
+                            now=lambda: clock[0], max_wait=30, keyless=False)
+        assert sleeps and sleeps[0] >= 2.0 and sleeps[0] < 5.0, \
+            f"devia esperar o ban MAIS CURTO, não o mais longo (esperas {sleeps})"
+        assert calls[0]["headers"]["Authorization"].endswith("A") and result["meta"]["attempts"] == 1
 
     def s_resposta_http_malformada_e_falha_de_rede():
         original = urllib.request.urlopen
@@ -2126,24 +2518,26 @@ def cmd_selftest() -> int:
 
         return sleeps, fake_sleep
 
-    def s_falha_transitoria_isolada_repete_a_conta():
-        pool = make_pool("A")
+    def s_falha_transitoria_bane_e_rotaciona():
+        pool = make_pool("A", "B")
         clock = [0.0]
         sleeps, fake_sleep = recording_sleep(clock)
         post, calls = transport([(503, {}, None), OK])
         result = run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0])
-        assert [c["headers"].get("Authorization", "keyless")[-1] for c in calls] == ["A", "A"], calls
-        assert result["meta"]["keyless_used"] is False, "um 5xx isolado repete a conta, não vai a keyless"
-        assert sleeps == [COOLDOWN_BASE_S], f"a repetição espera um backoff curto (obtido {sleeps})"
+        assert [c["headers"].get("Authorization", "keyless")[-1] for c in calls] == ["A", "B"], calls
+        assert result["meta"]["keyless_used"] is False, "a 2.ª conta serve; o keyless nem é preciso"
+        assert sleeps == [], "uma chave banida 24 h nunca é esperada dentro da invocação"
+        assert pool[0].status == "SUSPENDED" and pool[0].cooldown_until == clock[0] + BAN_S, \
+            "um 5xx bane a conta 24 h e segue para a próxima"
 
-    def s_nova_ronda_nao_fura_round_robin():
+    def s_cada_conta_falha_uma_vez_na_request():
         pool = make_pool("A", "B")
         clock = [0.0]
         _sleeps, fake_sleep = recording_sleep(clock)
         post, calls = transport([(503, {}, None), (429, {}, "0"), OK])
         run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0])
-        used = [c["headers"]["Authorization"][-1] for c in calls]
-        assert used == ["A", "B", "A"], f"uma chave com 429 'Retry-After: 0' não pode furar a ronda (obtido {used})"
+        used = [c["headers"]["Authorization"][-1] if "Authorization" in c["headers"] else "keyless" for c in calls]
+        assert used == ["A", "B", "keyless"], f"cada conta falha UMA vez e passa à seguinte (obtido {used})"
 
     def s_saldo_rede_na_preferida_rotaciona():
         pool = make_pool("A", "B")
@@ -2154,7 +2548,7 @@ def cmd_selftest() -> int:
         used = [c["headers"]["Authorization"][-1] for c in calls]
         assert used == ["A", "B"], f"timeout na conta com mais saldo tem de rodar para a seguinte (obtido {used})"
 
-    def s_pick_key_escaloes_de_saldo():
+    def s_pick_key_round_robin_estrito():
         def pool_with(*balances):
             pool = make_pool(*"ABC"[:len(balances)])
             for k, b in zip(pool, balances):
@@ -2165,11 +2559,17 @@ def cmd_selftest() -> int:
             key, _ = pick_key(pool, cursor, 0.0)
             return key.env_name[-1]
 
-        assert pick(pool_with(0, None), 0) == "B", "saldo 0 conhecido fica atrás do desconhecido"
-        assert pick(pool_with(0, 0), 0) == "A" and pick(pool_with(0, 0), 1) == "B", "todas a 0 → round-robin"
-        assert [pick(pool_with(100, None, 50), c) for c in (0, 1, 2)] == ["A", "B", "A"], \
-            "desconhecido e melhor saldo alternam; saldo inferior (50) fica para trás"
-        assert [pick(pool_with(None, None, None), c) for c in (0, 1, 2)] == ["A", "B", "C"], "sem saldo = round-robin"
+        assert [pick(pool_with(0, None), c) for c in (0, 1)] == ["A", "B"], \
+            "round-robin estrito: o saldo (0, desconhecido, alto) não altera a ordem"
+        assert [pick(pool_with(100, None, 50), c) for c in (0, 1, 2, 0)] == ["A", "B", "C", "A"], \
+            "a ordem é sempre o cursor, sem escalões de saldo"
+        banido = pool_with(None, None, None)
+        mark_rate_limited(banido[0], 0.0, ban_s=BAN_S)
+        assert pick(banido, 0) == "B", "uma chave banida não é selecionável"
+        assert pick_key(banido, 0, BAN_S)[0].env_name.endswith("A"), "com o ban expirado volta à rotação"
+        ocupado = pool_with(None, None, None)
+        assert pick_key(ocupado, 0, 0.0, skip={ocupado[0].hash_id})[0].env_name.endswith("B"), \
+            "skip salta a conta ocupada sem parar a ronda"
 
     def s_espera_de_concorrencia_usa_max_wait():
         pool = make_pool("A")
@@ -2183,7 +2583,7 @@ def cmd_selftest() -> int:
         assert 4.5 <= sum(sleeps) <= 5.0, f"a espera por concorrência tem de ir até --max-wait (esperou {sum(sleeps)})"
         assert result["meta"]["keyless_used"] is True and len(calls) == 1, "esgotada a espera, vai a keyless"
 
-    def s_transitorias_limitadas():
+    def s_falhas_sem_rajada_uma_tentativa_por_conta():
         pool = make_pool("A", "B")
         clock = [0.0]
         sleeps, fake_sleep = recording_sleep(clock)
@@ -2191,20 +2591,20 @@ def cmd_selftest() -> int:
 
         def post(_url, headers, _body, _t):
             calls.append(headers["Authorization"][-1] if "Authorization" in headers else "keyless")
-            if "Authorization" not in headers:
-                return (503, {}, None)
-            return (503, {}, None) if headers["Authorization"].endswith("A") else (429, {}, "1")
+            return (503, {}, None) if not "Authorization" in headers else (
+                (503, {}, None) if headers["Authorization"].endswith("A") else (429, {}, "1"))
 
         try:
             run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0])
             raise AssertionError("devia desistir")
         except SkillError as exc:
             assert "keyless incluída" in exc.problem, exc.problem
-        assert calls.count("A") == TRANSIENT_STRIKES, f"5xx persistente: no máx. {TRANSIENT_STRIKES} pedidos (A={calls})"
-        assert calls.count("keyless") <= TRANSIENT_STRIKES and calls.count("B") <= MAX_PASSES, calls
-        assert sum(sleeps) <= DEFAULT_MAX_WAIT + COOLDOWN_JITTER_S, "as esperas respeitam --max-wait"
+            assert "fora de rotação" in exc.problem, "o erro instrutivo aponta o ban ativo"
+        assert calls == ["A", "B", "keyless"], f"uma tentativa por conta e por passagem (obtido {calls})"
+        assert sleeps == [], "bans de 24 h nunca são esperados dentro de --max-wait"
+        assert pool[0].cooldown_until == BAN_S and pool[1].cooldown_until == BAN_S, "ambas fora por 24 h"
 
-    def s_retry_after_zero_sem_rajada():
+    def s_retry_after_zero_nao_gera_rajada():
         pool = make_pool("A")
         clock = [0.0]
         sleeps, fake_sleep = recording_sleep(clock)
@@ -2218,37 +2618,36 @@ def cmd_selftest() -> int:
             run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0])
         except SkillError:
             pass
-        assert calls.count("A") <= MAX_PASSES, f"'Retry-After: 0' não pode gerar rajada (A={calls.count('A')})"
-        assert sleeps and min(sleeps) >= COOLDOWN_BASE_S, "cada repetição espera pelo menos 0,5 s"
+        assert calls.count("A") == 1, f"'Retry-After: 0' não pode gerar rajada (A={calls.count('A')})"
+        assert pool[0].cooldown_until == BAN_S, "a chave fica 24 h fora de rotação"
         k = make_pool("Z")[0]
-        mark_rate_limited(k, 0.0, 10.0, lambda: 0.0)
-        assert k.cooldown_until == 10.0 + COOLDOWN_BASE_S, "o cooldown registado (visto por outros) tem piso"
+        mark_rate_limited(k, 10.0)
+        assert k.cooldown_until == 10.0 + BAN_S, "o ban registado (visto por outros processos) é de 24 h"
 
-    def s_backoff_429_escala():
+    def s_ban_fixo_nao_escala_e_sucesso_zera():
         k = make_pool("A")[0]
-        mark_rate_limited(k, None, 0.0, lambda: 0.0)
+        mark_rate_limited(k, 0.0)
         first = k.cooldown_until
         revive([k], first)
-        mark_rate_limited(k, None, first, lambda: 0.0)
-        assert k.cooldown_until - first > first, "o backoff sem Retry-After tem de escalar entre 429 seguidos"
+        mark_rate_limited(k, first)
+        assert k.cooldown_until == first + BAN_S, "o ban é sempre de 24 h (não escala nem encurta)"
         post, _c = transport([OK])
         run_search("q", pool=[k], post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 1e6)
         assert k.failures == 0, "um sucesso zera as falhas consecutivas"
 
-    def s_revogada_com_cooldown_residual_nao_espera():
+    def s_ban_longo_nunca_e_esperado():
         pool = make_pool("A")
-        mark_revoked(pool[0])
-        pool[0].cooldown_until = 20.0  # resíduo de um 429 anterior
+        mark_revoked(pool[0], 0.0)          # fora 24 h
         clock = [0.0]
         sleeps, fake_sleep = recording_sleep(clock)
-        post, calls = transport([(503, {}, None), (503, {}, None)])
+        post, _calls = transport([(429, {}, None)])
         try:
-            run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0])
+            run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0,
+                       now=lambda: clock[0], keyless=False)
             raise AssertionError("devia desistir")
-        except SkillError:
-            pass
-        assert all(s <= COOLDOWN_BASE_S + COOLDOWN_JITTER_S for s in sleeps), \
-            f"não se espera pelo cooldown de uma chave REVOKED (esperas {sleeps})"
+        except SkillError as exc:
+            assert "fora de rotação" in exc.problem and "keys unban" in exc.solution, str(exc)
+        assert sleeps == [], f"não se espera 24 h por uma chave banida (esperas {sleeps})"
 
     def s_live_isolado_um_pedido():
         probe = make_pool("A")
@@ -2563,23 +2962,6 @@ def cmd_selftest() -> int:
                 assert proc.returncode == 0, f"{argv}: exit {proc.returncode}: {err[-300:]!r}"
                 assert b"Traceback" not in err and b"Exception ignored" not in err, f"{argv}: {err[-300:]!r}"
 
-    def s_retry_after_formatos():
-        now = float(calendar.timegm((2026, 10, 21, 7, 27, 30, 0, 0, 0)))
-        assert parse_retry_after("Wed, 21 Oct 2026 07:28:00 +0000", now) == 30.0, "zona numérica"
-        assert parse_retry_after("wed, 21 oct 2026 07:28:00 gmt", now) == 30.0, "minúsculas"
-        import locale
-        previous = locale.setlocale(locale.LC_TIME)
-        for name in ("pt_PT.UTF-8", "pt_BR.UTF-8", "de_DE.UTF-8"):
-            try:
-                locale.setlocale(locale.LC_TIME, name)
-            except locale.Error:
-                continue
-            try:
-                assert parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", now) == 30.0, f"locale {name}"
-            finally:
-                locale.setlocale(locale.LC_TIME, previous)
-            break
-
     # ---- ronda 2 da revisão: resíduos ----
 
     def s_registo_aninhado_ao_absurdo():
@@ -2749,7 +3131,7 @@ def cmd_selftest() -> int:
                     pool[0].failures, pool[0].consec_base = 0, 0
                     pool[0].failures_reset = pool[0].dirty = True
                 else:
-                    mark_rate_limited(pool[0], None, 0.0, lambda: 0.0)
+                    mark_rate_limited(pool[0], 0.0)
                     pool[0].last_error, pool[0].error_observed = "HTTP 429", True
                 pool[0].total_requests += 1
                 stale.snapshot(pool, now=1.0)
@@ -2824,7 +3206,8 @@ def cmd_selftest() -> int:
             clock[0] += 1.0  # cada pedido demora 1 s: o cooldown de A expira durante o keyless
             return next(replies)
 
-        result = run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0])
+        result = run_search("q", pool=pool, post=post, sleep=fake_sleep, rng=lambda: 0.0, now=lambda: clock[0],
+                            ban_s=1.0)
         assert calls == ["A", "keyless", "A"] and result["meta"]["attempts"] == 3, calls
 
     def s_numeros_gigantes_nos_helpers():
@@ -2832,20 +3215,172 @@ def cmd_selftest() -> int:
         assert _as_float(float("nan"), 7.0) == 7.0 and _as_number(float("inf")) is None
         assert _as_number("12") == 12 and _as_number(True) is None
 
+    # ---- v0.4.0: ban de 24 h, rotação estrita e controlo global ----
+
+    REG_KEY = "tvly-REGISTO-AAAAAAAAAAAA"
+    ENV_KEY = "tvly-TERMINAL-BBBBBBBBBBBB"
+
+    def s_ban_24h_por_qualquer_falha():
+        for outcome in ((429, {}, "30"), (401, {}, None), (432, {}, None), (503, {}, None), OSError("timeout")):
+            pool = make_pool("A", "B")
+            post, _c = transport([outcome, OK])
+            run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0)
+            k = pool[0]
+            assert k.status != "ACTIVE" and k.cooldown_until == BAN_S, \
+                f"{outcome!r}: devia ficar fora de rotação 24 h (status {k.status}, até {k.cooldown_until})"
+            assert pick_key(pool, 0, 0.0)[0].env_name.endswith("B"), "enquanto banida não é selecionável"
+            assert pick_key(pool, 0, BAN_S)[0].env_name.endswith("A"), "passadas 24 h volta à rotação"
+
+    def s_revoked_volta_apos_o_ban():
+        k = make_pool("A")[0]
+        mark_revoked(k, 0.0)
+        assert k.status == "REVOKED" and pick_key([k], 0, BAN_S - 1)[0] is None, "antes do prazo: fora"
+        revived, _ = pick_key([k], 0, BAN_S)
+        assert revived is k, "um 401 bane 24 h — e VOLTA depois do ban"
+        legacy = make_pool("B")[0]
+        legacy.status, legacy.cooldown_until = "REVOKED", 0.0  # entrada de versão antiga, sem prazo
+        assert pick_key([legacy], 0, 1e12)[0] is None, "REVOKED sem prazo continua fora (só keys unban/--reset-state)"
+
+    def s_registo_global_cadastrar_e_remover():
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "keys.json")
+            reg = KeyRegistry.open(path)
+            entry, is_new = reg.add(REG_KEY, "producao", now=1.0)
+            assert is_new and entry["label"] == "producao"
+            again, is_new2 = reg.add(REG_KEY, "outro", now=2.0)
+            assert not is_new2 and again["label"] == "outro", "duplicado atualiza a etiqueta, não duplica"
+            mode = os.stat(path).st_mode & 0o777
+            assert mode == 0o600, f"keys.json tem de ser 0600 (ficou {oct(mode)})"
+            fresh = KeyRegistry.open(path)
+            assert [e["label"] for e in fresh.entries()] == ["outro"], "persiste entre invocações"
+            env = {"TAVILY_API_KEY_A": REG_KEY, "TAVILY_API_KEY_B": ENV_KEY}
+            pool = build_pool(fresh, env)
+            assert [k.env_name for k in pool] == ["outro", "TAVILY_API_KEY_B"], [k.env_name for k in pool]
+            assert pool[0].source == "registo" and pool[0].aliases == ["TAVILY_API_KEY_A"], \
+                "a mesma chave no registo e no terminal conta UMA vez (o registo é o canónico)"
+            assert fresh.remove(REG_KEY) is True
+            assert fresh.remove("tvly-NAO-EXISTE-abcdefghijklmnopqrst") is False
+            assert KeyRegistry.open(path).entries() == [], "removeu mesmo"
+
+    def s_chave_desativada_fica_de_fora_da_rotacao():
+        with tempfile.TemporaryDirectory() as td:
+            reg = KeyRegistry.open(os.path.join(td, "keys.json"))
+            reg.add(REG_KEY, "backup", now=0.0)
+            env = {"TAVILY_API_KEY_A": ENV_KEY}
+            pool = build_pool(reg, env)
+            reg.set_disabled(pool[0].hash_id, True)
+            live = selectable_pool(build_pool(reg, env), reg)
+            assert [k.env_name for k in live] == ["TAVILY_API_KEY_A"], "desativada sai da rotação em todo o lado"
+            post, calls = transport([OK])
+            run_search("q", pool=live, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0)
+            assert calls[0]["headers"]["Authorization"].endswith("BBBBBBBB"), "a pesquisa usa a outra"
+            reg.set_disabled(pool[0].hash_id, False)
+            assert len(selectable_pool(build_pool(reg, env), reg)) == 2, "enable devolve à rotação"
+
+    def s_unban_readmite_imediatamente():
+        with tempfile.TemporaryDirectory() as td:
+            pool = make_pool("A", "B")
+            env = {k.env_name: k.key for k in pool}
+            post, _c = transport([(429, {}, None), OK])
+            run_search("q", pool=pool, post=post, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 0.0,
+                       state=PoolState.open(td))
+            assert pool[0].status == "RATE_LIMITED"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert cmd_keys("unban", "#1", registry=KeyRegistry.memory(),
+                                state=PoolState.open(td), env=env, now=lambda: 1.0) == 0
+            assert "Ban levantado em 1" in out.getvalue(), out.getvalue()
+            pool2 = make_pool("A", "B")
+            post2, calls2 = transport([OK])
+            run_search("q", pool=pool2, post=post2, sleep=lambda _s: None, rng=lambda: 0.0, now=lambda: 1.0,
+                       state=PoolState.open(td))
+            assert calls2[0]["headers"]["Authorization"].endswith("A"), \
+                "unbanned já é selecionável na chamada seguinte"
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert cmd_keys("unban", None, all_=True, registry=KeyRegistry.memory(),
+                                state=PoolState.open(td), env=env, now=lambda: 2.0) == 0
+
+    def s_keys_add_valida_e_redige():
+        with tempfile.TemporaryDirectory() as td:
+            reg = KeyRegistry.open(os.path.join(td, "keys.json"))
+            state = PoolState.open(td)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert cmd_keys("add", None, registry=reg, state=state, key_value=REG_KEY,
+                                label="nova", now=lambda: 0.0) == 0
+            text = out.getvalue()
+            assert "nova" in text and "AAAAAAAAAAAA" not in text, f"o add nunca ecoa a chave: {text!r}"
+            for bad in ("curta", "tvly-dev- com espaço", "'aspas'"):
+                try:
+                    cmd_keys("add", None, registry=reg, state=state, key_value=bad, now=lambda: 0.0)
+                    raise AssertionError(f"{bad!r} devia ser recusada")
+                except SkillError as exc:
+                    assert "Solução:" in str(exc)
+            try:
+                cmd_keys("remove", "não-existe", registry=reg, state=state, env={}, now=lambda: 0.0)
+                raise AssertionError("seletor desconhecido devia falhar")
+            except SkillError as exc:
+                assert "keys list" in exc.solution, exc.solution
+
+    def s_keys_list_next_sem_segredos():
+        with tempfile.TemporaryDirectory() as td:
+            reg = KeyRegistry.open(os.path.join(td, "keys.json"))
+            reg.add(REG_KEY, "producao", now=0.0)
+            state = PoolState.open(td)
+            env = {"TAVILY_API_KEY_A": ENV_KEY}
+            k = KeyMeta("TAVILY_API_KEY_A", ENV_KEY)
+            mark_rate_limited(k, 0.0)
+            state.snapshot([k], now=0.0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert cmd_keys("list", registry=reg, state=state, env=env, now=lambda: 1.0) == 0
+                assert cmd_keys("next", registry=reg, state=state, env=env, now=lambda: 1.0) == 0
+            text = out.getvalue()
+            assert REG_KEY not in text and ENV_KEY not in text, f"keys list/next não podem ecoar chaves: {text!r}"
+            assert "fora=23 h" in text and "DESATIVADA" not in text, text
+            assert "Próxima da rotação: #1 producao" in text, text
+            assert "round-robin estrito" in text and "ban por falha: 1d 0h" in text, text
+
+    def s_ban_hours_cli_vs_ambiente():
+        assert resolve_ban_s(2.0, {}) == 7200.0, "--ban-hours vence o ambiente"
+        assert resolve_ban_s(0.5, {"TAVILY_BAN_HOURS": "99"}) == 1800.0
+        assert resolve_ban_s(None, {"TAVILY_BAN_HOURS": "1.5"}) == 5400.0, "ambiente vence a predefinição"
+        assert resolve_ban_s(None, {"TAVILY_BAN_HOURS": " 0,5 "}) == 1800.0, "vírgula decimal tolerada"
+        assert resolve_ban_s(None, {}) == BAN_S == 86400.0, "predefinição = 24 h"
+        for junk in ("abc", "-1", "0", "1e12", "", "inf", "nan", "99999"):
+            assert resolve_ban_s(None, {"TAVILY_BAN_HOURS": junk}) == BAN_S, f"{junk!r} → predefinição"
+
+    def s_registo_de_chaves_corrompido_tratado_como_vazio():
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "keys.json")
+            for garbage in ("não é json",
+                            '{"version": 1, "keys": [{"key": 42}, "x", {"label": "sem chave"}], "disabled": "não é lista"}',
+                            '{"version": 99, "keys": []}'):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(garbage)
+                reg = KeyRegistry.open(path)
+                assert reg.entries() == [], f"lixo tem de ser tratado como vazio ({garbage[:20]!r})"
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{"version": 1, "keys": [{"key": "%s", "label": "ok"}], "disabled": ["abc", 5, "abc"]}'
+                             % REG_KEY)
+            reg = KeyRegistry.open(path)
+            assert [e["label"] for e in reg.entries()] == ["ok"] and reg.disabled() == {"abc"}, \
+                "só o material válido fica (e o disabled deduplica)"
+
     print("selftest tavily.py — máquina de rotação (offline):")
     scenarios = [
-        ("rotação após 401 (chave morta → próxima e MESMA request)", s_rotaciona_apos_401),
-        ("rotação após 429 com Retry-After", s_rotaciona_apos_429),
-        ("432 suspende até ao mês seguinte", s_quota_ate_mes_seguinte),
+        ("rotação após 401: chave morta banida, próxima serve a MESMA request", s_rotaciona_apos_401),
+        ("rotação após 429: ban de 24 h (o Retry-After não encurta)", s_rotaciona_apos_429),
+        ("432/433: cota esgotada também é ban de 24 h", s_quota_bane_24h),
         ("pool morto → contingência keyless sem credencial", s_keyless_quando_pool_morto),
-        ("pool em cooldown → espera e repete a MESMA request", s_espera_e_repete_a_mesma_request),
-        ("400 é terminal (sem gastar chaves) e instrutivo", s_400_terminal_sem_rotacao),
-        ("falha de rede morre e rotaciona", s_rede_morre_e_rotaciona),
+        ("ban curto: espera o prazo e repete a MESMA request", s_espera_e_repete_a_mesma_request),
+        ("400 é terminal (erro do pedido, sem ban) e instrutivo", s_400_terminal_sem_rotacao),
+        ("falha de rede morre, bane e rotaciona", s_rede_morre_e_rotaciona),
         ("segredos redigidos na saída", s_redacao_de_segredos),
         ("truncagem no orçamento de contexto", s_truncagem_no_orcamento),
         ("rotação dentro da request é A→B→C", s_rotacao_deterministica_na_request),
         ("determinismo Pass^k: mesma entrada, mesmo comportamento", s_determinismo_pass_k),
-        ("registo persistente: chave morta não é re-tentada na invocação seguinte", s_estado_persistente_salta_chave_morta),
+        ("registo persistente: chave banida não é re-tentada na invocação seguinte", s_estado_persistente_salta_chave_morta),
         ("cursor persistido: a invocação seguinte não recomeça em A", s_cursor_nao_recomeca_do_inicio),
         ("concorrência: conta no teto é saltada para a próxima", s_concorrencia_conta_ocupada_salta),
         ("concorrência: todas ocupadas → espera e RETRY (não falha)", s_concorrencia_todas_ocupadas_espera_e_retry),
@@ -2853,23 +3388,22 @@ def cmd_selftest() -> int:
         ("registo persistido sem material de chave (0600, só hashes)", s_registo_nunca_contem_segredos),
         ("merge cross-processo: sem lost updates e REVOKED absorvente", s_registo_merge_cross_processo),
         ("registo indisponível degrada em memória sem partir a pesquisa", s_registo_indisponivel_nao_parte_pesquisa),
-        ("Retry-After com data HTTP (e delta/lixo) — independente do locale", s_retry_after_data_http),
-        ("Retry-After absurdo limitado a 1 h (não mata a chave por anos)", s_retry_after_absurdo_limitado),
+        ("ban de falha é PLANO: Retry-After (curto/absurdo/data/lixo) não muda as 24 h", s_ban_plano_ignora_retry_after),
         ("parse_usage com payload real de /usage (plan_limit numérico)", s_parse_usage_payload_real),
         ("parse_usage com plan_limit nulo, teto por chave e payload inválido", s_parse_usage_sem_teto_e_lixo),
         ("resolve_max_inflight: CLI > ambiente > predefinição (2); 0 = sem teto", s_resolve_max_inflight_prioridade),
         ("teto 0: conta cheia serve e nenhum slot alheio é libertado", s_teto_zero_nao_rouba_slots),
         ("load_keys: alias TAVILY_API_KEY = _A não duplica a rotação", s_load_keys_alias_sem_duplicar),
         ("load_keys: ordem determinística e dedup por valor", s_load_keys_ordem_deterministica),
-        ("saldo: a conta com mais créditos restantes serve primeiro", s_saldo_maior_serve_primeiro),
-        ("saldo: estimativa desconta créditos e o cursor desempata (B→A→B)", s_saldo_igual_alterna_com_cursor),
-        ("saldo: 5xx na conta preferida continua a rotacionar", s_saldo_falha_transitoria_ainda_rotaciona),
+        ("rotação estrita: a ordem ignora o saldo (só o cursor manda)", s_saldo_nao_manda_na_ordem),
+        ("chamadas seguidas alternam A→B→A com saldos desiguais", s_round_robin_estrito_alterna_entre_invocacoes),
+        ("5xx na conta da vez ban e segue para a seguinte", s_saldo_falha_transitoria_ainda_rotaciona),
         ("créditos contados por usage.credits (include_usage) ou pela profundidade", s_creditos_contados_pela_resposta),
         ("status: saldo com > 60 min é refrescado; fresco não consulta", s_usage_refresca_quando_velho),
         ("status: sem rajadas a /usage (≥ 6 min entre consultas; REVOKED salta)", s_usage_sem_rajadas),
         ("status ponta a ponta: refresca, persiste e não repete", s_status_refresca_e_persiste),
         ("status: nome canónico _A com alias em nota (pool a 2)", s_status_nome_canonico_sem_duplicar),
-        ("chave revogada não impede a espera pelo cooldown das outras", s_revogada_nao_impede_espera_de_cooldown),
+        ("com várias contas fora, espera-se o ban MAIS CURTO", s_espera_o_ban_mais_curto),
         ("resposta HTTP malformada é tratada como falha de rede", s_resposta_http_malformada_e_falha_de_rede),
         ("registo corrompido é tratado como ausente (sem rebentar)", s_registo_corrompido_nao_rebenta),
         ("erros de CLI seguem Erro:/Solução: (exit 2, sem traceback)", s_cli_erros_seguem_o_contrato),
@@ -2878,15 +3412,15 @@ def cmd_selftest() -> int:
         ("orçamento negativo nunca inverte o corte do texto", s_orcamento_invalido_nunca_inverte_o_corte),
         ("SkillError em main passa pela redação", s_skillerror_em_main_redigida),
         ("argparse não ecoa segredos (valores do env e tokens tvly-)", s_argparse_redige_segredos),
-        ("5xx isolado numa conta única: repete após backoff, sem keyless", s_falha_transitoria_isolada_repete_a_conta),
-        ("429 'Retry-After: 0' não fura a ronda (A→B→A como na v0.2.1)", s_nova_ronda_nao_fura_round_robin),
-        ("saldo: timeout na conta preferida continua a rotacionar", s_saldo_rede_na_preferida_rotaciona),
-        ("pick_key: escalões de saldo (0, desconhecido, inferior, empate)", s_pick_key_escaloes_de_saldo),
+        ("5xx/timeout: ban de 24 h e rotação para a próxima (sem repetir)", s_falha_transitoria_bane_e_rotaciona),
+        ("cada conta falha UMA vez por request: A→B→keyless", s_cada_conta_falha_uma_vez_na_request),
+        ("timeout na conta da vez ban e rotaciona", s_saldo_rede_na_preferida_rotaciona),
+        ("pick_key: round-robin estrito, salta banidas, revive ao fim do ban", s_pick_key_round_robin_estrito),
         ("concorrência: a espera vai até --max-wait e só depois keyless", s_espera_de_concorrencia_usa_max_wait),
-        ("falhas transitórias limitadas (2 por credencial) e esperas ≤ --max-wait", s_transitorias_limitadas),
-        ("'Retry-After: 0' não gera rajada (piso de 0,5 s)", s_retry_after_zero_sem_rajada),
-        ("backoff de 429 sem Retry-After escala; sucesso zera", s_backoff_429_escala),
-        ("chave REVOKED com cooldown residual não provoca espera", s_revogada_com_cooldown_residual_nao_espera),
+        ("falhas sem rajada: 1 tentativa por conta, bans de 24 h e erro instrutivo", s_falhas_sem_rajada_uma_tentativa_por_conta),
+        ("'Retry-After: 0' não gera rajada: 1 pedido e 24 h fora", s_retry_after_zero_nao_gera_rajada),
+        ("ban fixo (não escala); sucesso zera as falhas", s_ban_fixo_nao_escala_e_sucesso_zera),
+        ("ban de 24 h nunca é esperado: desiste com instrução (keys unban)", s_ban_longo_nunca_e_esperado),
         ("pedido isolado (selftest --live): 1 pedido, sem keyless", s_live_isolado_um_pedido),
         ("spent_at_check com créditos já gastos", s_spent_at_check_com_creditos),
         ("credits_spent persiste e desconta entre invocações", s_creditos_persistem_entre_invocacoes),
@@ -2899,7 +3433,7 @@ def cmd_selftest() -> int:
         ("vista antiga de outro processo não desfaz reset nem --check", s_vista_antiga_nao_desfaz_reset_nem_check),
         ("apagar o ficheiro de registo limpa-o de facto", s_registo_apagado_nao_ressuscita),
         ("registo com NaN/Infinity/inteiros gigantes/surrogates não rebenta", s_registo_com_nan_infinito_e_surrogates),
-        ("saldo de um mês anterior não guia a rotação (reset mensal)", s_saldo_do_mes_anterior_ignorado),
+        ("saldo de um mês anterior não guia nada (reset mensal)", s_saldo_do_mes_anterior_ignorado),
         ("checked_at no futuro é inválido (stale e perde o merge)", s_checked_at_no_futuro),
         ("--reset-state funciona mesmo sem chaves", s_reset_sem_chaves),
         ("sem registo persistente não há refrescamento automático", s_refresh_sem_registo_persistente),
@@ -2911,7 +3445,6 @@ def cmd_selftest() -> int:
         ("consulta com bytes não-UTF-8 → erro instrutivo, sem pedido", s_consulta_nao_utf8),
         ("stdout sem UTF-8 (ascii): status e --help sem traceback", s_stdout_sem_utf8),
         ("leitor fecha o pipe: exit 0, sem 'Exception ignored'", s_pipe_fechado_pelo_leitor),
-        ("Retry-After: zona numérica, minúsculas e locale não-C", s_retry_after_formatos),
         ("registo aninhado ao absurdo (RecursionError) não parte nada", s_registo_aninhado_ao_absurdo),
         ("espera longa por concorrência vai até --max-wait e acaba no keyless", s_espera_longa_chega_ao_keyless),
         ("slot com TTL máximo sobrevive a relógio ligeiramente atrasado", s_slot_com_ttl_maximo_sobrevive),
@@ -2930,6 +3463,15 @@ def cmd_selftest() -> int:
         ("max_attempts=1: exatamente 1 pedido", s_max_attempts_sozinho),
         ("conta revivida no fim da passagem ganha nova passagem", s_conta_revivida_no_fim_da_passagem),
         ("helpers numéricos: inteiros gigantes, NaN e Infinity", s_numeros_gigantes_nos_helpers),
+        ("qualquer falha (429/401/432/5xx/rede) ban 24 h e revive ao fim", s_ban_24h_por_qualquer_falha),
+        ("401 volta ao fim do ban; REVOKED sem prazo (legado) não", s_revoked_volta_apos_o_ban),
+        ("registo global: cadastra, deduplica com o terminal, remove (0600)", s_registo_global_cadastrar_e_remover),
+        ("keys disable tira a chave da rotação; enable devolve", s_chave_desativada_fica_de_fora_da_rotacao),
+        ("keys unban readmite já na próxima chamada", s_unban_readmite_imediatamente),
+        ("keys add valida formato, nunca ecoa a chave; seletor errado é instrutivo", s_keys_add_valida_e_redige),
+        ("keys list/next: estado global da rotação sem segredos", s_keys_list_next_sem_segredos),
+        ("ban: --ban-hours > TAVILY_BAN_HOURS > 24 h (lixo ignorado)", s_ban_hours_cli_vs_ambiente),
+        ("keys.json corrompido é tratado como vazio (sem rebentar)", s_registo_de_chaves_corrompido_tratado_como_vazio),
     ]
     for name, fn in scenarios:
         scenario(name, fn)
@@ -2951,6 +3493,23 @@ def resolve_max_inflight(cli_value: int | None, env: dict[str, str] | None = Non
     if env_value.isascii() and env_value.isdigit():
         return int(env_value)
     return DEFAULT_MAX_INFLIGHT
+
+
+def resolve_ban_s(cli_value: float | None, env: dict[str, str] | None = None) -> float:
+    """Duração do ban por falha (em segundos): CLI (--ban-hours) >
+    TAVILY_BAN_HOURS > predefinição (24 h). Valores de ambiente inválidos ou
+    fora de (0, 30 dias] são ignorados."""
+    if cli_value is not None:
+        return float(cli_value) * 3600.0
+    env = os.environ if env is None else env
+    raw = (env.get("TAVILY_BAN_HOURS") or "").strip().replace(",", ".")
+    try:
+        hours = float(raw)
+    except ValueError:
+        hours = 0.0
+    if math.isfinite(hours) and 0.0 < hours <= BAN_HOURS_MAX:
+        return hours * 3600.0
+    return BAN_S
 
 
 class _Parser(argparse.ArgumentParser):
@@ -2981,7 +3540,7 @@ def _number_arg(kind, minimum: float, maximum: float, *, strict: bool = False):
 
 
 def cmd_selftest_live(timeout: float = DEFAULT_TIMEOUT, env: dict[str, str] | None = None,
-                      get=None, post=None) -> int:
+                      get=None, post=None, registry: KeyRegistry | None = None) -> int:
     """Integração REAL (gasta créditos): por conta, 1 consulta a /usage (grátis)
     + 1 pesquisa `ultra-fast` com 1 resultado (≈1 crédito) SÓ com essa conta —
     exatamente 1 pedido, sem rotação, sem retry e sem keyless, para que cada
@@ -2989,7 +3548,7 @@ def cmd_selftest_live(timeout: float = DEFAULT_TIMEOUT, env: dict[str, str] | No
     registo persistente."""
     env = os.environ if env is None else env
     get = http_get_json if get is None else get
-    pool = load_keys(env)
+    pool = selectable_pool(build_pool(registry, env), registry)
     invalid = invalid_key_vars(env)
     remember_secrets(secret_values(env))
     if not pool and not invalid:
@@ -3064,6 +3623,10 @@ def _build_parser() -> _Parser:
     p_search.add_argument("--no-state", action="store_true", help="não persistir o registo do pool (modo efémero)")
     p_search.add_argument("--state-dir", default=None,
                           help="diretório do registo (predef.: $TAVILY_STATE_DIR ou ~/.local/state/tavily-agent-skill)")
+    p_search.add_argument("--keys-file", default=None,
+                          help="registo global de chaves (predef.: <state-dir>/keys.json ou $TAVILY_KEYS_FILE)")
+    p_search.add_argument("--ban-hours", type=_number_arg(float, 0.0, BAN_HOURS_MAX, strict=True), default=None,
+                          help=f"duração do ban de uma chave que falhe, em horas (predef. {BAN_HOURS_DEFAULT:g} ou TAVILY_BAN_HOURS)")
     p_search.add_argument("--verbose", action="store_true", help="traços de rotação em stderr (redigidos)")
 
     p_status = sub.add_parser("status", help="estado do pool de chaves (sem segredos)")
@@ -3074,8 +3637,22 @@ def _build_parser() -> _Parser:
     p_status.add_argument("--reset-state", action="store_true",
                           help="limpa o registo persistente (todas as chaves voltam a ser consideradas)")
     p_status.add_argument("--state-dir", default=None, help="diretório do registo (ver search)")
+    p_status.add_argument("--keys-file", default=None, help="registo global de chaves (ver search)")
     p_status.add_argument("--timeout", type=timeout_arg, default=DEFAULT_TIMEOUT)
     p_status.add_argument("--verbose", action="store_true", help="diagnóstico em stderr (redigido)")
+
+    p_keys = sub.add_parser("keys", help="controlo global: chaves cadastradas, bans e rotação")
+    p_keys.add_argument("action", nargs="?", default="list",
+                        choices=["list", "add", "remove", "enable", "disable", "unban", "next"],
+                        help="list (predef.) · add · remove · enable · disable · unban · next")
+    p_keys.add_argument("target", nargs="?", default=None,
+                        help='chave a cadastrar (add) ou seletor: "#2", nome, "…ab12" ou hash')
+    p_keys.add_argument("--label", default=None, help="etiqueta da chave (add)")
+    p_keys.add_argument("--from-env", default=None, metavar="VAR",
+                        help="add: lê o valor da variável do terminal (não passa pela linha de comandos)")
+    p_keys.add_argument("--all", action="store_true", help="unban --all: readmite todas as chaves banidas")
+    p_keys.add_argument("--state-dir", default=None, help="diretório dos registos (ver search)")
+    p_keys.add_argument("--keys-file", default=None, help="registo global de chaves (ver search)")
 
     p_selftest = sub.add_parser("selftest", help="verificação determinística da máquina de rotação (offline)")
     p_selftest.add_argument("--live", action="store_true",
@@ -3098,19 +3675,28 @@ def _run(argv: list[str] | None) -> int:
             return code
         if args.command == "status":
             state = PoolState.open(args.state_dir)
+            registry = KeyRegistry.open(args.keys_file or default_keys_file(args.state_dir))
             return cmd_status(args.check, args.timeout, state=state,
                               reset_state=args.reset_state,
                               max_inflight=resolve_max_inflight(None),
+                              registry=registry,
                               refresh=not args.no_refresh)
+        if args.command == "keys":
+            state = PoolState.open(args.state_dir)
+            registry = KeyRegistry.open(args.keys_file or default_keys_file(args.state_dir))
+            return cmd_keys(args.action, args.target, registry=registry, state=state,
+                            label=args.label, from_env=args.from_env, all_=args.all)
 
-        pool = load_keys()
+        registry = KeyRegistry.open(args.keys_file or default_keys_file(args.state_dir))
+        remember_secrets(entry["key"] for entry in registry.entries())
+        pool = selectable_pool(build_pool(registry), registry)
         for name in invalid_key_vars():
             print(f"Aviso: {name} ignorada — formato de chave inválido (espaços, aspas, quebras de linha ou "
                   f"caracteres fora de ASCII); corrija o valor da variável.", file=sys.stderr)
         if not pool:
             print(
-                "Aviso: nenhuma chave Tavily no terminal — a usar contingência keyless (limites mais severos). "
-                'Declare o pool (export TAVILY_API_KEY_A="tvly-…") para limites normais.',
+                "Aviso: nenhuma chave Tavily disponível — a usar contingência keyless (limites mais severos). "
+                'Cadastre o pool (tavily.py keys add "tvly-…" --label conta-A) para limites normais.',
                 file=sys.stderr,
             )
         state = PoolState.memory() if args.no_state else PoolState.open(args.state_dir)
@@ -3126,6 +3712,7 @@ def _run(argv: list[str] | None) -> int:
             pool=pool,
             state=state,
             max_inflight=resolve_max_inflight(args.max_inflight_per_key),
+            ban_s=resolve_ban_s(args.ban_hours),
         )
         if args.json:
             print(redact(json.dumps(result, ensure_ascii=False, indent=2), _SECRETS))
