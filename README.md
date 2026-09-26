@@ -20,7 +20,7 @@ python3 ~/.agents/skills/tavily-agent-skill/scripts/tavily.py status            
 python3 ~/.agents/skills/tavily-agent-skill/scripts/tavily.py selftest             # verificar instalação
 ```
 
-## Chaves — mesmo formato do plugin DSH
+## Chaves — pool com rotação automática
 
 ```bash
 export TAVILY_API_KEY_A="tvly-..."   # tantas contas quantas quiser (A..D, ...)
@@ -33,9 +33,11 @@ Sem chaves, opera em modo *keyless* (limites mais severos). Obter chaves: [app.t
 ## O que torna esta skill diferente
 
 - **Gestão de requests invisível**: 429/432/401/5xx/rede → marca a credencial, rotaciona e reemite a *mesma* request; se o pool todo estiver impedido, espera o cooldown mais curto e repete. Só há erro (instrutivo: `Erro:` + `Solução:`, exit 2) quando não há mesmo nenhuma alternativa.
-- **Determinística**: `selftest` prova 11 cenários da máquina de rotação offline (Pass^k — mesma entrada, mesmo comportamento).
+- **Registo interno persistente**: estado por chave, cursor de round-robin e consumo real (`/usage`) guardados em `~/.local/state/tavily-agent-skill` — a invocação seguinte não recomeça do início nem re-tenta chaves mortas. Sem material de chave no disco (só hashes, 0600).
+- **Concorrência controlada por conta**: teto de requests simultâneas (predef. 2, cross-processo) — contas no teto são saltadas; se todas ocuparem, espera e repete antes do keyless.
+- **Determinística**: `selftest` prova 19 cenários da máquina de rotação offline (Pass^k — mesma entrada, mesmo comportamento).
 - **Segura**: segredos redigidos por valor na saída; conteúdo web tratado como dado não-confiável (anti injeção indireta); egress só para `api.tavily.com`.
-- **Económica**: divulgação progressiva (SKILL.md enxuto; `references/` só quando preciso) e saída limitada a 50 KB por invocação.
+- **Económica**: divulgação progressiva (SKILL.md enxuto; `references/` só quando preciso) e saída limitada a 50 KB por invocação; `status --check` valida sem gastar créditos.
 
 ## Estrutura
 

@@ -1,9 +1,9 @@
 ---
 name: tavily-agent-skill
-version: "0.1.0"
+version: "0.2.1"
 description: >-
   Pesquisa web em tempo real via API Tavily com rotação AUTOMÁTICA de chaves declaradas no
-  terminal (TAVILY_API_KEY_A..D, mesmo formato do plugin DSH) — se uma request morrer (429
+  terminal (TAVILY_API_KEY_A..D) — se uma request morrer (429
   rate limit, 432 cota, 401 chave morta, timeout, 5xx, rede), o script puxa OUTRA chave e refaz
   a MESMA request; o agente que chama nunca vê o erro nem precisa de gerir nada. Funciona em
   QUALQUER agente/terminal, dentro ou fora do DSH (sem plugin). Use para pesquisar na web,
@@ -56,12 +56,26 @@ python3 scripts/tavily.py selftest                                     # verific
 | Comando | Faz | Saída |
 | --- | --- | --- |
 | `search <query>` | pesquisa com rotação transparente | stdout: resposta + fontes (ou `--json`); exit 0 |
-| `status` | pool: variáveis encontradas, refs mascaradas, saúde | tabela; `--check` valida ao vivo (gasta 1 crédito/chave) |
+| `status` | pool: variáveis encontradas, refs mascaradas, saúde, consumo | tabela; `--check` valida ao vivo via `/usage` (NÃO gasta créditos) |
 | `selftest` | corre a máquina de rotação contra transportes falsos | PASS/FAIL por cenário; exit 0/1 |
 
 Opções úteis de `search`: `--json` · `--depth ultra-fast\|fast\|basic\|advanced` ·
 `--max-results 1..10` · `--topic general\|news` · `--no-answer` · `--timeout 25` ·
-`--max-wait 30` · `--max-bytes 51200` · `--verbose` (traços de rotação em stderr).
+`--max-wait 30` · `--max-bytes 51200` · `--max-inflight-per-key 2` · `--no-state` ·
+`--state-dir` · `--verbose` (traços de rotação em stderr).
+
+## Controlos de pool (persistentes entre invocações)
+
+- **Registo interno por chave** (`pool-state.json`): estado, cooldowns,
+  contadores, último erro, consumo real e cursor de round-robin. A invocação
+  seguinte **não recomeça do início** nem re-tenta chaves mortas — retoma onde
+  ficou e salta o que já falhou. Limpar com `status --reset-state`.
+- **Limite de requests simultâneas por conta** (cross-processo, predef. 2):
+  contas no teto são saltadas para a próxima; se todas estiverem ocupadas, o
+  script **espera e repete a MESMA request** antes de recorrer ao modo keyless.
+- O registo identifica chaves por hash e vive em
+  `$TAVILY_STATE_DIR` (ou `~/.local/state/tavily-agent-skill`) — **nunca**
+  contém material de chave. `--no-state` volta ao modo efémero.
 
 ## Regras de ouro para quem chama
 
@@ -77,7 +91,7 @@ Opções úteis de `search`: `--json` · `--depth ultra-fast\|fast\|basic\|advan
 5. Em caso de exit ≠ 0, a mensagem segue o formato `Erro: …` + `Solução: …` —
    siga a solução indicada antes de repetir.
 
-## Chaves no terminal (mesmo formato do plugin DSH)
+## Chaves no terminal (pool com rotação automática)
 
 ```bash
 export TAVILY_API_KEY_A="tvly-..."    # tantas contas quantas quiser (A..D, ...)
@@ -100,10 +114,12 @@ Só carregue quando precisar de exactamente isto:
 
 ## Garantias (para confiar sem verificar)
 
-- **Determinístico**: `selftest` prova offline 10 cenários da máquina de rotação
+- **Determinístico**: `selftest` prova offline 19 cenários da máquina de rotação
   (chave morta, cota, pool todo em cooldown → espera e repete, 400 terminal,
-  rede, redação de segredos, truncagem). Corra-o após qualquer mudança.
-- **Isolado**: stdlib apenas; estado efémero por invocação (nada persiste em
-  disco); rede só para `api.tavily.com`.
+  rede, redação de segredos, truncagem, registo persistente, cursor, teto de
+  concorrência). Corra-o após qualquer mudança.
+- **Isolado**: stdlib apenas; o único estado persistente é o registo do pool
+  (opaco, por hash, 0600, sem segredos) em `~/.local/state/tavily-agent-skill`;
+  rede só para `api.tavily.com`.
 - **Orçamento de contexto**: saída truncada a 50 KB por invocação
   (`--max-bytes`), para não saturar a janela do modelo.

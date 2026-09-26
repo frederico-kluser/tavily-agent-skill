@@ -1,7 +1,7 @@
 # Chaves Tavily no terminal (Nível 3)
 
-O formato é **idêntico ao do plugin DSH** (`dsh-tavily-resilient-search`), para
-poder alternar entre ambos sem mudar de hábito.
+O pool usa o formato `TAVILY_API_KEY_A..D` — o padrão para agrupamentos de
+contas com rotação automática.
 
 ## Declaração
 
@@ -21,8 +21,23 @@ export TAVILY_API_KEY="tvly-..."
   é estável entre invocações.
 - Sem nenhuma chave, funciona em modo **keyless** (limites mais severos) e avisa
   em stderr.
+- ⚠️ **Declare sempre o pool `A..D` quando quiser rotação.** Com só a chave
+  única `TAVILY_API_KEY`, não há fallback: quando essa conta atinge o limite,
+  não há segunda hipótese. Com 2+ contas, o script rotaciona sozinho.
 - Obter chaves: <https://app.tavily.com> (plano grátis: 1000 créditos/mês,
   repostos no 1.º dia do mês).
+
+## Variáveis de controlo (opcionais)
+
+```bash
+export TAVILY_STATE_DIR="/caminho/p/estado"        # registo do pool (predef.: ~/.local/state/tavily-agent-skill)
+export TAVILY_MAX_INFLIGHT_PER_KEY="2"             # máx. de requests SIMULTÂNEAS por conta (0 = sem teto)
+```
+
+O registo (`pool-state.json`, 0600) guarda estado por chave, cursor de
+round-robin, contadores e consumo — identificando cada credencial por hash
+`sha256` (nunca o material da chave). É o que faz a invocação seguinte saltar
+chaves mortas e **não recomeçar sempre do início**. Limpar: `status --reset-state`.
 
 ## Persistir no shell (cuidado)
 
@@ -41,8 +56,13 @@ repositório não estão em lado nenhum do código — só no teu terminal.
 | Sintoma | Causa | O que fazer |
 | --- | --- | --- |
 | `status` mostra 0 chaves | variáveis não exportadas nesta shell | `export …` ou reabre o terminal |
+| uma conta atinge o limite e as chamadas falham | chave única não tem rotação de fallback | declarar 2+ contas (`_A.._D`) — o script rotaciona sozinho |
 | `401` em `status --check` | chave copiada mal ou revogada | gerar nova em app.tavily.com |
 | `429` repetido | plano grátis: 100 RPM | mais contas (A..D) — o script já rotaciona |
+| `429` com pesquisas paralelas | rajadas simultâneas na mesma conta | baixar o teto (`TAVILY_MAX_INFLIGHT_PER_KEY=1`) ou mais contas |
+| chave morta continua a ser tentada ou o pool "recomeça sempre em A" | registo desativado (`--no-state`) ou limpo | deixar o registo ativo; `status` mostra cursor e contadores |
+| `status --check` diz "rate limit do endpoint /usage" | `/usage` tem teto próprio (10 req/10 min) | esperar um minuto e repetir |
+| estado do registo estranho/obsoleto | registo dessincronizado da realidade | `python3 scripts/tavily.py status --reset-state` |
 | `432` | cota mensal esgotada | espera pelo 1.º do mês ou declara outra conta |
 | tudo falha com "pool: …" | todas suspensas | `--max-wait 60` e repetir, ou novas chaves |
 | resultados vazios | consulta demasiado específica | simplificar; `--topic general`; `--depth basic` |
