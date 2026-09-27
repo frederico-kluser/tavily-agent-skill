@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.0 — 2026-09-27
+
+### Alterado — a pesquisa profunda só acontece mediante a flag `--deep-research`
+- **Gatilho único e verificável**: o modo pesquisa profunda deixa de ser ativado
+  por contexto ("pesquisa profunda", "deep research", "investiga a fundo",
+  "revisão da literatura"…) e **só acontece quando a invocação leva a flag
+  `--deep-research`**. Sem a flag: `research init|lint` recusam com exit 2
+  (`Erro:` + `Solução: …`) e o `search` faz **sempre** pesquisa simples — o
+  SKILL.md manda, nesse caso, fazer a pesquisa simples e avisar que o modo
+  profundo exige a flag.
+- **`search --deep-research "pergunta"`**: nova porta de entrada do modo —
+  equivalente a `research init --deep-research` (kickoff do protocolo: cria o
+  dossiê `pesquisas/AAAA-MM-DD-<slug>.md`, offline e sem gastar créditos; as
+  restantes opções de `search` não se aplicam neste modo).
+- **`research init|lint --deep-research`**: a flag passa a ser **obrigatória**
+  nos dois subcomandos (`--out` e `--json` mantêm-se; o caminho de `--out`
+  também entra pelo `research init --deep-research`).
+- Documentação coerente com o comportamento real: `SKILL.md` (gatilho único,
+  regra de ouro nova, tabela de comandos e opções), `README.md`,
+  `references/pesquisa-profunda.md` (porta de entrada) e `references/api.md`.
+- `selftest`: novo cenário do portão da flag (recusa sem ela, nada criado;
+  kickoff com ela; `search --deep-research` cria o dossiê) — agora **121**
+  cenários offline.
+
 ## 0.5.0 — 2026-09-27
 
 ### Adicionado — modo pesquisa profunda

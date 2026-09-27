@@ -4,7 +4,7 @@
 
 > Pesquisa web para agentes de LLM via **API Tavily** com **rotação automática de chaves** — **round-robin estrito** (cada chamada troca de chave) e **ban de 24 h** para qualquer chave que falhe (429 rate limit, 432 cota, 401 chave morta, timeout, 5xx, rede): a chave falhada fica de fora e não é selecionável; o script puxa **outra chave e refaz a mesma request**. O agente que chama nunca vê o erro nem precisa de gerir nada. O controlo global é o comando **`keys`**.
 
-Por cima disso, um **modo pesquisa profunda** focado só em qualidade: decomposição em sub-perguntas, subagentes em paralelo, rondas até a auditoria de lacunas fechar, fontes académicas, verificação adversarial e um **dossiê Markdown com FAQ em árvore** — com **escudo nativo contra injeção de prompts** em todo o texto que vem da web.
+Por cima disso, um **modo pesquisa profunda** focado só em qualidade — ativado **exclusivamente pela flag `--deep-research`** (`search --deep-research "…"` / `research init|lint --deep-research`), nunca por contexto: decomposição em sub-perguntas, subagentes em paralelo, rondas até a auditoria de lacunas fechar, fontes académicas, verificação adversarial e um **dossiê Markdown com FAQ em árvore** — com **escudo nativo contra injeção de prompts** em todo o texto que vem da web.
 
 Agent Skill (spec aberta) que funciona em **qualquer agente/terminal**, dentro ou fora do DeepSeek Harness — sem plugin, sem dependências (Python stdlib).
 
@@ -28,17 +28,20 @@ python3 ~/.agents/skills/tavily-agent-skill/scripts/tavily.py selftest --live   
 
 ## Pesquisa profunda
 
+Só acontece mediante a **flag `--deep-research`** — o `research init|lint` recusa sem ela (exit 2) e o `search` sem a flag é sempre pesquisa simples (mesmo que o pedido diga "pesquisa profunda" ou "deep research").
+
 ```bash
 T=~/.agents/skills/tavily-agent-skill/scripts/tavily.py
-python3 $T research init "a pergunta principal"                                # dossiê com modelo de FAQ
+python3 $T search --deep-research "a pergunta principal"                       # ATIVA o modo: kickoff + dossiê com FAQ
+python3 $T research init --deep-research "a pergunta" --out dossie.md          # idem, com caminho próprio
 python3 $T search "retrieval augmented generation survey" --preset academico --depth advanced --json
 python3 $T search '"frase exata a confirmar"' --exact --start-date 2024-01-01   # filtros de data/frase
 python3 $T extract https://arxiv.org/pdf/2402.14207 --query "o que procuro"     # texto integral (envelope com nonce)
 python3 $T shield retorno-do-subagente.json                                     # escudo sobre qualquer texto
-python3 $T research lint pesquisas/<dossie>.md                                  # erros + veredito CONTINUAR/PRONTO
+python3 $T research lint --deep-research pesquisas/<dossie>.md                  # erros + veredito CONTINUAR/PRONTO
 ```
 
-O agente segue o protocolo de [`references/pesquisa-profunda.md`](references/pesquisa-profunda.md): brief → decomposição (perspetivas × facetas) → 1 subagente por pergunta, em paralelo → integração com níveis de fonte A–D e confiança tipo GRADE → auditoria de lacunas (checklist + crítico + `lint`) → nova ronda ou verificação adversarial (3 votos por afirmação central) → síntese por um único redator. Onde pesquisar: [`references/fontes-de-pesquisa.md`](references/fontes-de-pesquisa.md). Segurança: [`references/escudo-injecao.md`](references/escudo-injecao.md).
+Com a flag, o agente segue o protocolo de [`references/pesquisa-profunda.md`](references/pesquisa-profunda.md): brief → decomposição (perspetivas × facetas) → 1 subagente por pergunta, em paralelo → integração com níveis de fonte A–D e confiança tipo GRADE → auditoria de lacunas (checklist + crítico + `lint`) → nova ronda ou verificação adversarial (3 votos por afirmação central) → síntese por um único redator. Onde pesquisar: [`references/fontes-de-pesquisa.md`](references/fontes-de-pesquisa.md). Segurança: [`references/escudo-injecao.md`](references/escudo-injecao.md).
 
 ## Chaves — controlo global (`keys`)
 
@@ -69,9 +72,9 @@ Sem chaves, opera em modo *keyless* (limites mais severos). Obter chaves: [app.t
 - **Registo interno persistente**: estado por hash (nunca material de chave), bans, cursor, créditos e consumo real (`/usage`) em `~/.local/state/tavily-agent-skill` — a invocação seguinte não recomeça do início nem re-tenta chaves banidas.
 - **Saldo sempre fresco**: `status` refresca sozinho o saldo com mais de 60 min, sem rajadas contra o limite de `/usage` (máx. 1 consulta por conta a cada 6 min).
 - **Concorrência controlada por conta**: teto de requests simultâneas (predef. 2, cross-processo) — contas no teto são saltadas; se todas ocuparem, espera e repete antes do keyless.
-- **Pesquisa profunda nativa**: filtros de domínio/data/frase exata, presets académicos (`academico`, `saude`, `computacao`, `oficial`), `extract` de texto integral com orçamento justo entre fontes, e `research init|lint` — o `lint` apanha citações fantasma, fontes sem URL/DOI, nós órfãos, conclusão prematura e vetores de exfiltração, e diz se falta outra ronda.
+- **Pesquisa profunda nativa, só mediante a flag `--deep-research`**: filtros de domínio/data/frase exata, presets académicos (`academico`, `saude`, `computacao`, `oficial`), `extract` de texto integral com orçamento justo entre fontes, e `research init|lint` — sem a flag o `research` recusa (exit 2) e o `search` é sempre pesquisa simples; com ela, o `lint` apanha citações fantasma, fontes sem URL/DOI, nós órfãos, conclusão prematura e vetores de exfiltração, e diz se falta outra ronda.
 - **Escudo anti-injeção**: remove texto invisível (tags Unicode, bidi, zero-width), neutraliza marcadores de papel (`<|im_start|>`, `[INST]`, `<tool_call>`…), deteta injeções EN/PT/ES (risco médio/alto por fonte), `--quarantine` retém fontes de risco alto e o `extract` usa envelopes com nonce inforjável. Calibrado sem falsos positivos em texto técnico comum.
-- **Determinística**: `selftest` prova 120 cenários offline (Pass^k — mesma entrada, mesmo comportamento); corre na CI em Python 3.10, 3.12 e 3.14 a cada push.
+- **Determinística**: `selftest` prova 121 cenários offline (Pass^k — mesma entrada, mesmo comportamento), incluindo o portão `--deep-research` da pesquisa profunda; corre na CI em Python 3.10, 3.12 e 3.14 a cada push.
 - **Segura**: segredos redigidos por valor em toda a saída (incluindo `--json` e `--verbose`); conteúdo web tratado como dado não-confiável (anti injeção indireta); egress só para `api.tavily.com`.
 - **Económica**: divulgação progressiva (SKILL.md enxuto; `references/` só quando preciso) e saída limitada a 50 KB por invocação; `status --check` valida sem gastar créditos.
 

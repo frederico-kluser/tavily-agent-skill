@@ -1,9 +1,15 @@
 # Modo pesquisa profunda (Nível 3)
 
-Carregue este ficheiro quando o pedido for uma **pesquisa profunda**:
-"pesquisa profunda", "deep research", "investiga a fundo", "revisão da
-literatura", "estado da arte", "levantamento exaustivo", "quero a melhor
-resposta possível sobre X", "com artigos científicos".
+Carregue este ficheiro SOMENTE quando a invocação trouxer a flag
+**`--deep-research`** (`search --deep-research "pergunta"` ou
+`research init --deep-research`) — ela é o **único gatilho** deste modo e o
+script valida-a: sem a flag, `research init|lint` recusam com exit 2 e o
+`search` faz sempre pesquisa simples. Sem a flag, **não** carregue este
+ficheiro nem siga este protocolo, nem que o pedido diga "pesquisa profunda",
+"deep research", "investiga a fundo", "revisão da literatura", "estado da
+arte", "levantamento exaustivo", "quero a melhor resposta possível sobre X"
+ou "com artigos científicos": faça uma pesquisa `search` simples e avise que
+o modo profundo exige `--deep-research`.
 
 Este modo **não tem compromisso com a velocidade nem com o custo**, só com a
 qualidade. Não há teto de rondas nem de subagentes. A pesquisa só termina
@@ -77,7 +83,7 @@ que puder. O protocolo não muda.
 ## 3. O ciclo
 
 ```
- Fase 0  ENQUADRAR ─ brief + critérios de «terminado» ─ research init
+ Fase 0  ENQUADRAR ─ brief + critérios de «terminado» ─ search --deep-research
     │
  Fase 1  DECOMPOR ─ perspetivas × facetas → Q1..Qn (prioridade, dependências)
     │
@@ -85,7 +91,7 @@ que puder. O protocolo não muda.
  │     │
  │   Fase 3  INTEGRAR E ANALISAR ─ FAQ, fontes [S#], matriz, contradições, escudo
  │     │
- │   Fase 4  AUDITAR LACUNAS ─ checklist + crítico + research lint + saturação
+ │   Fase 4  AUDITAR LACUNAS ─ checklist + crítico + research lint --deep-research + saturação
  │     │
  │     ├── há bloqueios/lacunas? ── novas sub-perguntas (Q1.1, Q2.3…) ──┐
  │     │                                                                  │
@@ -95,17 +101,18 @@ que puder. O protocolo não muda.
        │ (afirmação derrubada → volta à Fase 4)
  Fase 6  SINTETIZAR ─ redator único, de uma vez, só com o que está na FAQ
        │
-       └─ estado: concluido + research lint com 0 erros
+       └─ estado: concluido + research lint --deep-research com 0 erros
 ```
 
 Comandos (`SKILL` = diretório desta skill):
 
 ```bash
-python3 SKILL/scripts/tavily.py research init "pergunta principal"      # cria pesquisas/AAAA-MM-DD-<slug>.md
+python3 SKILL/scripts/tavily.py search --deep-research "pergunta principal"   # ATIVA o modo: cria pesquisas/AAAA-MM-DD-<slug>.md
+python3 SKILL/scripts/tavily.py research init --deep-research "pergunta" --out <ficheiro>   # idem, com caminho próprio
 python3 SKILL/scripts/tavily.py search "consulta" --json --depth advanced [--preset academico] [--quarantine]
 python3 SKILL/scripts/tavily.py extract URL [URL…] --query "o que procuro" [--json]
 python3 SKILL/scripts/tavily.py shield retorno.json                     # escudo sobre o retorno de um subagente
-python3 SKILL/scripts/tavily.py research lint pesquisas/<dossie>.md     # validação + veredito CONTINUAR/PRONTO
+python3 SKILL/scripts/tavily.py research lint --deep-research pesquisas/<dossie>.md     # validação + veredito CONTINUAR/PRONTO
 ```
 
 ## 4. Fase 0–1: como quebrar um problema
@@ -383,14 +390,14 @@ No fim de **cada** ronda:
    faria.
 3. **Fontes recolhidas mas não usadas**: percorra-as e pergunte-se se revelam
    algo que ninguém perguntou (origem `fonte-nao-usada`).
-4. **`research lint`**: corrija os ERROS; os **bloqueios** são a lista mínima
+4. **`research lint --deep-research`**: corrija os ERROS; os **bloqueios** são a lista mínima
    da próxima ronda.
 5. **Saturação**: preencha a linha da ronda no Registo de rondas com fontes
    novas, afirmações novas e lacunas abertas.
 
 **Conclua (Fase 5) só quando TODOS forem verdade:**
 
-- [ ] `research lint`: 0 erros e veredito `PRONTO-PARA-SINTESE`: nenhuma
+- [ ] `research lint --deep-research`: 0 erros e veredito `PRONTO-PARA-SINTESE`: nenhuma
       pergunta aberta, e as de prioridade alta resolvidas com confiança ≥
       moderada ou justificadas.
 - [ ] Todos os critérios de «terminado» do brief estão `[x]` com `[S#]`.
@@ -447,7 +454,7 @@ Registe o resultado na coluna «Verificação adversarial» da matriz (ex.:
 4. Frontmatter: `estado: concluido`, `atualizado:` com a data de hoje, e
    `ronda:` com a última ronda. Preencha a Metodologia com rondas,
    subagentes, consultas e fontes lidas na íntegra.
-5. `research lint` → 0 erros. Só então entregue: resposta curta ao
+5. `research lint --deep-research` → 0 erros. Só então entregue: resposta curta ao
    utilizador, com o caminho do dossiê.
 
 ## 7. Modelos de delegação (copiar e preencher)
@@ -587,7 +594,8 @@ RETORNO (APENAS JSON):
 
 ## 8. O dossiê e o modelo de FAQ
 
-`research init` cria `pesquisas/AAAA-MM-DD-<slug>.md` com estas secções.
+`search --deep-research` (ou `research init --deep-research`) cria
+`pesquisas/AAAA-MM-DD-<slug>.md` com estas secções.
 Há um dossiê completo e real em `references/exemplo-dossie.md`: a pesquisa que
 desenhou este modo, com 3 rondas, 9 perguntas e 17 fontes, validada pelo
 `lint`.

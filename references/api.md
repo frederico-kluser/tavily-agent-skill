@@ -49,7 +49,7 @@ Erros de filtro (domínio inválido, data impossível, listas acima do limite)
 são detetados **antes** do pedido — nunca gastam créditos. Existem também
 `/crawl`, `/map` e `/research` na API — não cobertos por esta skill (o modo
 pesquisa profunda é orquestrado pelo agente, com controlo de qualidade e
-escudo próprios).
+escudo próprios, e só acontece mediante a flag `--deep-research`).
 
 ### Endpoint de extração (`extract`)
 
