@@ -1,4 +1,4 @@
-# Contrato da API Tavily e a máquina de rotação (Nível 3)
+# Contrato da API Tavily, a máquina de rotação e o escudo (Nível 3)
 
 Carregue este ficheiro só quando precisar de interpretar `--verbose`, afinar
 `--timeout`/`--max-wait`/`--ban-hours`, ou perceber exatamente o que o script
@@ -27,8 +27,63 @@ Corpo enviado por `scripts/tavily.py search`:
 gastos): o script soma-os a `credits_spent` da conta que serviu — é o que
 mantém viva a estimativa de saldo entre consultas a `/usage` (sem o campo,
 usa o custo documentado: `advanced` = 2, `basic`/`fast`/`ultra-fast` = 1).
-`include_raw_content` nunca é enviado (explosão de contexto). Existem também
-`/extract`, `/crawl`, `/map` e `/research` na API — não cobertos por esta skill.
+`include_published_date` (sempre enviado, sem custo) traz a data de publicação
+estimada de cada resultado — aparece entre parênteses no texto e como
+`published_date` no JSON. `include_raw_content` nunca é enviado (explosão de
+contexto): o texto integral lê-se com `extract`, sob orçamento.
+
+Filtros opcionais (só entram no corpo quando usados — pesquisa profunda):
+
+| Opção do script | Campo da API | Notas |
+| --- | --- | --- |
+| `--preset NOME` (repetível) | `include_domains` | listas curadas (`academico`, `saude`, `computacao`, `oficial`) — ver `fontes-de-pesquisa.md` |
+| `--include-domains a.org,b.org` | `include_domains` | máx. 300; só domínios (URLs são reduzidos ao domínio; curingas/caminhos recusados) |
+| `--prefer-domains` | `include_domains_mode: "prefer"` | prioriza os domínios em vez de restringir |
+| `--exclude-domains …` | `exclude_domains` | máx. 150 |
+| `--time-range day\|week\|month\|year` | `time_range` | |
+| `--start-date` / `--end-date AAAA-MM-DD` | `start_date` / `end_date` | validadas localmente (início ≤ fim) |
+| `--exact` | `exact_match: true` | só resultados com a(s) frase(s) entre aspas da consulta |
+| `--topic finance` | `topic` | além de `general`/`news` |
+
+Erros de filtro (domínio inválido, data impossível, listas acima do limite)
+são detetados **antes** do pedido — nunca gastam créditos. Existem também
+`/crawl`, `/map` e `/research` na API — não cobertos por esta skill (o modo
+pesquisa profunda é orquestrado pelo agente, com controlo de qualidade e
+escudo próprios).
+
+### Endpoint de extração (`extract`)
+
+`POST https://api.tavily.com/extract` — texto integral de 1..20 URLs, com a
+**mesma máquina de rotação** (bans, round-robin, concorrência, keyless):
+
+```json
+{
+  "urls": ["https://arxiv.org/pdf/2402.14207"],
+  "extract_depth": "basic",
+  "format": "markdown",
+  "include_images": false,
+  "include_favicon": false,
+  "include_usage": true,
+  "timeout": 60.0,
+  "query": "opcional: ordena os trechos",
+  "chunks_per_source": 3
+}
+```
+
+- `query` (+ `chunks_per_source` 1..5) faz a API devolver só os trechos mais
+  relevantes de cada página, unidos por `[...]` — ideal para confirmar uma
+  citação literal sem trazer o artigo inteiro.
+- `timeout` do servidor = `--timeout` do script − 5 s (entre 1 e 60): uma
+  página lenta falha **sozinha** (`failed_results`) em vez de o pedido inteiro
+  morrer por timeout do lado de cá — o que baniria a chave. Por isso o
+  `--timeout` predefinido do `extract` é 75 s (o servidor usa até 30 s em
+  `advanced`).
+- Custo: `usage.credits` quando vem na resposta; senão 1 crédito (basic) ou 2
+  (advanced) por cada 5 URLs extraídas com sucesso. URLs falhados não custam.
+- Orçamento **justo** entre fontes (max-min): as curtas ficam inteiras e as
+  longas repartem as sobras — um PDF enorme não apaga os restantes.
+- Saída de texto em **envelope com nonce** aleatório por invocação
+  (`⟪FONTE n · nonce …⟫ … ⟪/FONTE n · nonce …⟫`) — ver `escudo-injecao.md`.
 
 ### Endpoint de consumo (`status --check`)
 
@@ -279,8 +334,38 @@ in-flight guarda a sua **expiração**, não o início.)
 - **Atalhos**: `keys unban --all` readmite tudo já; `status --reset-state`
   recomeça o registo do zero.
 
+## Escudo anti-injeção (todo o texto vindo da web)
+
+Aplicado a `answer`, `title`, `content` (e à URL/data, só higienização) de
+`search` e `extract`, **antes** do orçamento — a deteção vê o texto completo:
+
+1. **Higieniza**: remove *tags* Unicode (U+E0000–E007F, «ASCII smuggling»),
+   seletores de variação em série (U+FE00–FE0F e U+E0100–E01EF, «emoji
+   smuggling»; um seletor isolado, como em ❤️, fica), controlos bidi
+   (U+202A–202E, U+2066–2069), invisíveis (zero-width, soft hyphen, BOM) e
+   controlos C0/C1 (ESC/ANSI, backspace, NUL). O texto escondido em *tags* ou
+   em seletores é descodificado **só para análise**.
+2. **Neutraliza**: marcadores de papel/modelo (`<|im_start|>`, `[INST]`,
+   `<<SYS>>`, `<system>`, `<tool_call>`, `<function_calls>`…) viram `⟦…⟧`; os
+   caracteres do envelope (`⟪` `⟫`) viram `«` `»`.
+3. **Deteta** (EN/PT/ES) → `shield: {"risk": "medio|alto", "flags": [...]}` na
+   fonte e `meta.shield` no total. Sinais: `ignorar-instrucoes` (alto),
+   `exfiltracao` (alto), `texto-oculto-com-instrucoes` (alto),
+   `redefinir-papel`, `dirigido-a-ia`, `ocultar-do-utilizador`,
+   `marcador-de-papel`, `unicode-oculto` (médios). Três sinais distintos, ou
+   «dirigido-a-ia» + um comportamento pedido, sobem a risco alto.
+4. **Isola** (`--quarantine`): fontes de risco alto ficam só com
+   título/URL/sinais; uma `answer` sintetizada com risco alto é descartada.
+
+Os padrões foram calibrados contra texto técnico legítimo (documentação de
+APIs com «include your API key», CSS «override the rules», «you are now a
+member»…) e o selftest prova ambos os lados. Continua a ser uma heurística —
+a outra metade da defesa é o protocolo dos agentes (`escudo-injecao.md`).
+
 ## Orçamento de contexto
 
 A saída é truncada a 50 KB por invocação (`--max-bytes`), com corte em limites
 de ponto de código UTF-8 (nunca parte caracteres). `meta.truncated: true` no
-JSON indica que houve truncagem.
+JSON indica que houve truncagem. No `search` o orçamento é sequencial
+(resposta, depois fontes por ordem); no `extract` é repartido de forma justa
+entre fontes.

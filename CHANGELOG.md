@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.5.0 — 2026-09-27
+
+### Adicionado — modo pesquisa profunda
+- **Protocolo** `references/pesquisa-profunda.md`: brief como estrela-guia,
+  decomposição por perspetivas × facetas (STORM), dependências
+  (*least-to-most*/*self-ask*), graduação de esforço, orquestrador +
+  investigadores em paralelo sem teto, integração com níveis de fonte A–D e
+  confiança tipo GRADE, contradições como sub-perguntas, auditoria de lacunas
+  (checklist + crítico de contexto limpo + `research lint`), critérios de
+  paragem e regra de estagnação, verificação adversarial (3 votos, 2/3 para
+  derrubar), síntese por redator único e modelos de delegação prontos a usar
+  (investigador, verificador, crítico) com retorno só em JSON. Desenhado a
+  partir de três rondas de pesquisa com verificação adversarial e fontes
+  primárias (Anthropic, LangChain, Gemini, STORM/Co-STORM, IterDRAG, FAIR-RAG,
+  OpenAI, Microsoft, CaMeL, padrões de desenho, ataques adaptativos, FORGE/RQA,
+  GRADE, SIFT, Wineburg & McGrew, estudos de citações inventadas).
+- **Onde pesquisar** `references/fontes-de-pesquisa.md`: bases académicas e
+  APIs abertas, presets de domínios, operadores, *snowballing* de citações e
+  verificação de citações (DOI, retratações).
+- **Escudo nativo anti-injeção** (`references/escudo-injecao.md`): em TODO o
+  texto vindo da web (`search` e `extract`) — higienização de invisíveis
+  (tags Unicode/«ASCII smuggling», bidi, zero-width), neutralização de
+  marcadores de papel (`<|im_start|>`, `[INST]`, `<tool_call>`…), deteção
+  EN/PT/ES com risco por fonte (`shield`, `meta.shield`, `⚠ escudo` no texto),
+  `--quarantine` e envelope com nonce inforjável no `extract`.
+- **`extract <url…>`**: texto integral de 1..20 URLs pela mesma máquina de
+  rotação (bans, round-robin, concorrência); `--query`/`--chunks` para trechos
+  relevantes, `--depth`, `--format`, `--json`; prazo do servidor abaixo do do
+  cliente (uma página lenta não bane a chave); orçamento justo entre fontes;
+  créditos por `usage.credits` ou 1–2 por cada 5 URLs.
+- **Filtros de `search`**: `--preset academico|saude|computacao|oficial`,
+  `--include-domains`, `--exclude-domains`, `--prefer-domains`, `--time-range`,
+  `--start-date`/`--end-date`, `--exact`, `--topic finance`; a data de
+  publicação (`include_published_date`) vem sempre. Erros de filtro são
+  detetados antes do pedido.
+- **`research init|lint`**: cria o dossiê Markdown (brief, síntese, FAQ em
+  árvore, registo de rondas, matriz de evidência, contradições, fontes,
+  incidentes de segurança, limitações, metodologia) e valida-o — linhagem da
+  FAQ, estados/confiança, citações fantasma, fontes sem URL/DOI, triangulação,
+  conclusão prematura, imagens remotas/HTML ativo/invisíveis — com veredito
+  `CONTINUAR` (e a lista mínima da próxima ronda) ou `PRONTO-PARA-SINTESE`.
+- **`shield [ficheiro|-]`**: escudo sobre qualquer texto (ex.: o retorno de um
+  subagente — injeção de 2.ª ordem); `--json`, `--sanitize`.
+- **Bibliotecário em série**: as APIs académicas (arXiv, Semantic Scholar,
+  Crossref, OpenAlex) têm limites que somam todos os processos (o arXiv proíbe
+  contorná-los) — um único papel faz DOI/metadados/retratações/snowballing.
+- **`references/exemplo-dossie.md`**: dossiê real e concluído (a pesquisa que
+  desenhou este modo: 3 rondas, 321 subagentes, 75 afirmações sob verificação
+  adversarial), validado pelo `lint` no selftest.
+- Escudo também contra **emoji smuggling** (seletores de variação em série,
+  descodificados só para análise) e controlos C0/C1 (ESC/ANSI) — técnicas que
+  evadiram detetores comerciais em 80–100 % dos casos.
+- Selftest: 103 → **120 cenários** (filtros, domínios/datas, escudo com
+  positivos e falsos positivos, texto oculto, envelope, quarentena, `extract`
+  com rotação/créditos/orçamento justo, dossiê/lint, `shield`, CLI sem
+  traceback).
+
+### Mudado
+- O ciclo de rotação passou a ser partilhado por `/search` e `/extract`
+  (`_rotating_request`) — comportamento de `search` inalterado (os 103
+  cenários anteriores continuam verdes).
+
 ## 0.4.0 — 2026-09-26
 
 ### Mudança de contrato (pedido do utilizador)
